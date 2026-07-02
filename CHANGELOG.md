@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/) (0.x while the API stabilises).
 
+## [0.4.1]
+
+### Changed
+- Set the package author email in project metadata (now shown on PyPI).
+- CI: bumped GitHub Actions to their latest majors (`checkout`, `setup-uv`,
+  `upload-artifact`, `download-artifact`).
+
 ## [0.4.0]
 
 ### Added
