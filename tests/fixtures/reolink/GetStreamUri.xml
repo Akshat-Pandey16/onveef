@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+            xmlns:tt="http://www.onvif.org/ver10/schema">
+  <s:Body>
+    <trt:GetStreamUriResponse>
+      <trt:MediaUri>
+        <tt:Uri>rtsp://192.168.1.30:554/h264Preview_01_main</tt:Uri>
+        <tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>
+        <tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>
+        <tt:Timeout>PT30S</tt:Timeout>
+      </trt:MediaUri>
+    </trt:GetStreamUriResponse>
+  </s:Body>
+</s:Envelope>

@@ -1,0 +1,64 @@
+[project]
+name = "onveef"
+dynamic = ["version"]
+description = "A fast, zeep-free ONVIF-compatible SOAP client for IP cameras (Profile S/T/G/M/A/C)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Akshat Pandey" }]
+keywords = ["onvif", "ip-camera", "ptz", "rtsp", "soap", "vms", "cctv"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.28",
+    "defusedxml>=0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "mypy>=1.13",
+    "ruff>=0.8",
+    "types-defusedxml>=0.7",
+    "build>=1.2",
+    "twine>=5.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/onveef"
+Issues = "https://github.com/your-org/onveef/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/onveef/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/onveef"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RET", "PTH", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
