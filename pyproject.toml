@@ -27,15 +27,19 @@ dependencies = [
 dev = [
     "pytest>=8",
     "mypy>=1.13",
-    "ruff>=0.8",
+    "ruff>=0.15",
     "types-defusedxml>=0.7",
     "build>=1.2",
     "twine>=5.1",
+    "commitizen>=4.16",
+    "pre-commit>=3.8",
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/onveef"
-Issues = "https://github.com/your-org/onveef/issues"
+Homepage = "https://github.com/Akshat-Pandey16/onveef"
+Repository = "https://github.com/Akshat-Pandey16/onveef"
+Issues = "https://github.com/Akshat-Pandey16/onveef/issues"
+Changelog = "https://github.com/Akshat-Pandey16/onveef/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]
@@ -62,3 +66,13 @@ files = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.4.0"
+tag_format = "v$version"
+version_scheme = "pep440"
+version_files = ["src/onveef/__init__.py:__version__"]
+update_changelog_on_bump = true
+changelog_incremental = true
+major_version_zero = true

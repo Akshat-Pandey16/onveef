@@ -163,8 +163,9 @@ def test_client_relay_output_options_routes_to_deviceio() -> None:
 
 
 def test_password_text_fallback_after_digest_401() -> None:
+    """The digest-401 path retries once with PasswordText; clock sync is pinned off here."""
     client = _client(creds=OnvifCredentials("admin", "pw"))
-    client._clock_synced = True  # isolate the text-fallback path from clock sync
+    client._clock_synced = True
 
     def responder(envelope: str) -> tuple[int, str]:
         if "PasswordText" in envelope:

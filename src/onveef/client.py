@@ -1,4 +1,5 @@
 """High-level synchronous ONVIF client and its device-operation wrappers."""
+
 from __future__ import annotations
 
 import logging
@@ -36,9 +37,7 @@ _CONTENT_TYPES = (
     "text/xml; charset=utf-8",
 )
 _NOAUTH_OPERATIONS = frozenset({"GetSystemDateAndTime", "GetCapabilities", "GetServices"})
-_ISO8601_DURATION = re.compile(
-    r"^-?P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$"
-)
+_ISO8601_DURATION = re.compile(r"^-?P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$")
 
 
 def _iso8601_seconds(value: str, default: float) -> float:
@@ -397,9 +396,7 @@ class OnvifClient:
                 raise OnvifTimeoutError(f"ONVIF call '{operation}' timed out: {exc}") from exc
             except httpx.HTTPError as exc:
                 self._record_failure()
-                raise OnvifTransportError(
-                    f"ONVIF transport error: {exc}", retryable=True
-                ) from exc
+                raise OnvifTransportError(f"ONVIF transport error: {exc}", retryable=True) from exc
             except OnvifTransportError:
                 self._record_failure()
                 raise
@@ -553,7 +550,9 @@ class OnvifClient:
                 logger.warning(
                     "onveef: digest auth failed for '%s'; retrying with plaintext PasswordText%s",
                     operation,
-                    " over an unencrypted http:// connection" if xaddr.startswith("http://") else "",
+                    " over an unencrypted http:// connection"
+                    if xaddr.startswith("http://")
+                    else "",
                 )
                 return self._call_raw(
                     xaddr=xaddr,

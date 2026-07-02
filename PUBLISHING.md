@@ -62,20 +62,24 @@ Do not release unless all four pass.
 
 ## 2. Bump the version
 
-Single source of truth is `pyproject.toml` (`[project].version`). Keep
-`src/onveef/__init__.py::__version__` and `DEFAULT_USER_AGENT` in sync.
-
-- `0.x.y` while the API is stabilising (this is where we are).
-- Follow [SemVer](https://semver.org/): breaking change → major, feature → minor,
-  fix → patch. Record changes in `CHANGELOG.md`.
-- Never re-upload a version that already exists on PyPI — **PyPI rejects
-  re-uploads of the same version**. Bump, then build.
+The version is derived from `src/onveef/__init__.py::__version__` (hatchling reads
+it via `[tool.hatch.version]`, so `pyproject.toml` carries `dynamic = ["version"]`).
+[Commitizen](https://commitizen-tools.github.io/commitizen/) manages the bump: it
+reads your [Conventional Commits](https://www.conventionalcommits.org) since the
+last tag, picks the next [SemVer](https://semver.org/) number (`fix:` → patch,
+`feat:` → minor, `feat!:`/`BREAKING CHANGE:` → major), updates `__init__.py` and
+`CHANGELOG.md`, commits, and tags — all in one step:
 
 ```bash
-# after editing the version in pyproject.toml + __init__.py
-git commit -am "release: v0.2.0"
-git tag v0.2.0
+uv run cz bump --yes            # auto-detects the increment from commits
+# or force it:  uv run cz bump --yes --increment MINOR
+git push --follow-tags
 ```
+
+While the API is stabilising we stay on `0.x.y` (`major_version_zero = true`, so a
+breaking change bumps the minor). Never re-upload a version that already exists —
+**PyPI rejects re-uploads**. In practice you rarely run this by hand: the
+**Bump version** GitHub Action (§6) does it for you.
 
 ---
 
@@ -141,42 +145,45 @@ pip install <name>             # from a clean machine/venv
 
 ## 6. Automated release (GitHub Actions)
 
-Recommended: **PyPI Trusted Publishing** — no tokens stored anywhere. Configure it
-once at <https://pypi.org/manage/account/publishing/> (bind repo + workflow +
-environment), then use:
+Three workflows in `.github/workflows/` implement the whole loop — **no tokens
+stored anywhere**:
 
-```yaml
-# .github/workflows/release.yml
-name: release
-on:
-  push:
-    tags: ["v*"]
-permissions:
-  contents: read
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --extra dev
-      - run: uv run ruff check src tests && uv run mypy && uv run pytest -q
-      - run: uv build
-      - uses: actions/upload-artifact@v4
-        with: { name: dist, path: dist/ }
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write            # required for Trusted Publishing (OIDC)
-    steps:
-      - uses: actions/download-artifact@v4
-        with: { name: dist, path: dist/ }
-      - uses: pypa/gh-action-pypi-publish@release/v1
-```
+| Workflow | Trigger | Does |
+|---|---|---|
+| `ci.yml` | every push / PR to `main` | ruff + mypy + pytest on Python 3.11–3.13 |
+| `bump.yml` | manual (**Actions → Bump version → Run**) | `cz bump` → updates `__init__.py` + `CHANGELOG.md`, commits, tags `vX.Y.Z`, pushes |
+| `release.yml` | a pushed `vX.Y.Z` tag | build → `twine check` → publish to PyPI → GitHub Release |
 
-Tag `vX.Y.Z` → CI builds, tests, and publishes. No secrets required.
+So the normal release is: land Conventional Commits on `main` → click **Run** on
+*Bump version* → the new tag triggers *Release* → PyPI + a GitHub Release appear.
+You can still tag manually (`uv run cz bump --yes && git push --follow-tags`) to
+trigger `release.yml`.
+
+### One-time setup
+
+**1. PyPI Trusted Publishing** (no API token). Enable once at
+<https://pypi.org/manage/account/publishing/> → *Add a pending publisher*:
+
+- **PyPI project name:** `onveef` (your final name)
+- **Owner / Repository:** `Akshat-Pandey16` / `onveef`
+- **Workflow name:** `release.yml`
+- **Environment name:** `pypi`
+
+That binding lets the `pypi-publish` job (which requests `id-token: write` in the
+`pypi` environment) upload without secrets.
+
+**2. Turn publishing on.** The publish job is gated on a repo **variable** so a tag
+never publishes by accident. In *Settings → Secrets and variables → Actions →
+Variables*, add `PUBLISH_ENABLED = true` when you are ready to ship. Until then,
+pushing a tag just builds and checks — it never uploads.
+
+**3. Let the bump tag trigger a release.** A tag pushed with the built-in
+`GITHUB_TOKEN` does **not** start other workflows, so `bump.yml` would otherwise
+never fire `release.yml`. Create a fine-grained **PAT** (contents: read/write on
+this repo) and add it as the secret `RELEASE_PAT`; `bump.yml` uses it to push so
+the new tag triggers `release.yml`. (Without it, push the tag yourself to release.)
+If `main` is branch-protected, also allow this actor to push, or change `bump.yml`
+to open a PR instead of pushing to `main`.
 
 ---
 

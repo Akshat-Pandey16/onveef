@@ -279,9 +279,7 @@ class AsyncOnvifClient:
                 text = bytes(body).decode("utf-8", errors="replace")
             return response.status_code, text, response.headers.get("WWW-Authenticate", "")
 
-    async def _post_soap(
-        self, *, url: str, envelope: str, content_type: str
-    ) -> tuple[int, str]:
+    async def _post_soap(self, *, url: str, envelope: str, content_type: str) -> tuple[int, str]:
         status, text, challenge = await self._raw_post(
             url=url, content_type=content_type, envelope=envelope, auth=None
         )
@@ -302,18 +300,14 @@ class AsyncOnvifClient:
         last_text = ""
         for ct in _CONTENT_TYPES:
             try:
-                status, text = await self._post_soap(
-                    url=xaddr, envelope=envelope, content_type=ct
-                )
+                status, text = await self._post_soap(url=xaddr, envelope=envelope, content_type=ct)
             except httpx.TimeoutException as exc:
                 if self._read_override_s is None:
                     self._record_failure()
                 raise OnvifTimeoutError(f"ONVIF call '{operation}' timed out: {exc}") from exc
             except httpx.HTTPError as exc:
                 self._record_failure()
-                raise OnvifTransportError(
-                    f"ONVIF transport error: {exc}", retryable=True
-                ) from exc
+                raise OnvifTransportError(f"ONVIF transport error: {exc}", retryable=True) from exc
             except OnvifTransportError:
                 self._record_failure()
                 raise
@@ -384,9 +378,7 @@ class AsyncOnvifClient:
                 add_timestamp=self._ws_timestamp if with_auth else False,
             )
             try:
-                return await self._send_cycle(
-                    xaddr=xaddr, operation=operation, envelope=envelope
-                )
+                return await self._send_cycle(xaddr=xaddr, operation=operation, envelope=envelope)
             except (OnvifTimeoutError, OnvifServiceUnavailableError) as exc:
                 transient = exc
             except OnvifTransportError as exc:
@@ -532,18 +524,14 @@ class AsyncOnvifClient:
             )
 
         try:
-            return await self._post_xml(
-                url=subscription_url, envelope=build(), operation=operation
-            )
+            return await self._post_xml(url=subscription_url, envelope=build(), operation=operation)
         except OnvifAuthError:
             if self._clock_synced or not self._credentials.configured:
                 raise
             await self._sync_clock_offset()
             if self._clock_offset_s == 0.0:
                 raise
-            return await self._post_xml(
-                url=subscription_url, envelope=build(), operation=operation
-            )
+            return await self._post_xml(url=subscription_url, envelope=build(), operation=operation)
 
     async def get_device_information(self) -> dict[str, str]:
         """Return the device's manufacturer/model/firmware/serial/hardware information."""
@@ -745,9 +733,7 @@ class AsyncOnvifClient:
         await self.call(
             service="device",
             operation="SetNetworkDefaultGateway",
-            body_inner=envelopes.device_set_network_default_gateway(
-                ipv4_addresses=ipv4_addresses
-            ),
+            body_inner=envelopes.device_set_network_default_gateway(ipv4_addresses=ipv4_addresses),
         )
 
     async def get_dns(self) -> dict[str, Any]:
@@ -975,9 +961,7 @@ class AsyncOnvifClient:
             ),
         )
 
-    async def add_ptz_configuration(
-        self, *, profile_token: str, configuration_token: str
-    ) -> None:
+    async def add_ptz_configuration(self, *, profile_token: str, configuration_token: str) -> None:
         """Add a PTZ configuration to a profile."""
         service, _ = await self._media_service()
         await self.call(
@@ -1331,9 +1315,7 @@ class AsyncOnvifClient:
     async def get_audio_sources(self) -> list[dict[str, Any]]:
         """Return the device's audio sources (legacy Media service)."""
         if not await self._has("media"):
-            raise OnvifCapabilityMissingError(
-                "GetAudioSources requires the legacy Media service."
-            )
+            raise OnvifCapabilityMissingError("GetAudioSources requires the legacy Media service.")
         xml = await self.call(
             service="media",
             operation="GetAudioSources",
@@ -1344,9 +1326,7 @@ class AsyncOnvifClient:
     async def get_audio_outputs(self) -> list[dict[str, Any]]:
         """Return the device's audio outputs (legacy Media service)."""
         if not await self._has("media"):
-            raise OnvifCapabilityMissingError(
-                "GetAudioOutputs requires the legacy Media service."
-            )
+            raise OnvifCapabilityMissingError("GetAudioOutputs requires the legacy Media service.")
         xml = await self.call(
             service="media",
             operation="GetAudioOutputs",
@@ -1585,9 +1565,7 @@ class AsyncOnvifClient:
             body_inner=envelopes.media2_delete_profile(token=token),
         )
 
-    async def media2_get_profiles(
-        self, *, types: list[str] | None = None
-    ) -> list[dict[str, Any]]:
+    async def media2_get_profiles(self, *, types: list[str] | None = None) -> list[dict[str, Any]]:
         """Return Media2 profiles, optionally filtered by configuration ``types``."""
         xml = await self.call(
             service="media2",
@@ -1840,9 +1818,7 @@ class AsyncOnvifClient:
         )
         return parsers.parse_ptz_configurations(xml)
 
-    async def ptz_get_configuration_options(
-        self, *, configuration_token: str
-    ) -> dict[str, Any]:
+    async def ptz_get_configuration_options(self, *, configuration_token: str) -> dict[str, Any]:
         """Return the option ranges for a PTZ configuration."""
         xml = await self.call(
             service="ptz",
@@ -1853,9 +1829,7 @@ class AsyncOnvifClient:
         )
         return parsers.parse_named_element(xml, "PTZConfigurationOptions")
 
-    async def ptz_send_auxiliary_command(
-        self, *, profile_token: str, auxiliary_data: str
-    ) -> None:
+    async def ptz_send_auxiliary_command(self, *, profile_token: str, auxiliary_data: str) -> None:
         """Send a PTZ auxiliary command (e.g. a wiper or IR light)."""
         await self.call(
             service="ptz",
@@ -1972,9 +1946,7 @@ class AsyncOnvifClient:
         xml = await self.call(
             service="imaging",
             operation="GetCurrentPreset",
-            body_inner=envelopes.imaging_get_current_preset(
-                video_source_token=video_source_token
-            ),
+            body_inner=envelopes.imaging_get_current_preset(video_source_token=video_source_token),
         )
         return parsers.parse_named_element(xml, "Preset")
 
@@ -2060,9 +2032,7 @@ class AsyncOnvifClient:
             ),
         )
 
-    async def delete_analytics_modules(
-        self, *, configuration_token: str, names: list[str]
-    ) -> None:
+    async def delete_analytics_modules(self, *, configuration_token: str, names: list[str]) -> None:
         """Delete named analytics modules from a configuration."""
         await self.call(
             service="analytics",
@@ -2072,9 +2042,7 @@ class AsyncOnvifClient:
             ),
         )
 
-    async def create_rules(
-        self, *, configuration_token: str, rules: list[dict[str, Any]]
-    ) -> None:
+    async def create_rules(self, *, configuration_token: str, rules: list[dict[str, Any]]) -> None:
         """Create analytics rules on a configuration."""
         await self.call(
             service="analytics",
@@ -2084,9 +2052,7 @@ class AsyncOnvifClient:
             ),
         )
 
-    async def modify_rules(
-        self, *, configuration_token: str, rules: list[dict[str, Any]]
-    ) -> None:
+    async def modify_rules(self, *, configuration_token: str, rules: list[dict[str, Any]]) -> None:
         """Modify analytics rules on a configuration."""
         await self.call(
             service="analytics",
@@ -2167,9 +2133,7 @@ class AsyncOnvifClient:
             self._read_override_s = prev_override
         return parsers.parse_pull_messages(xml)
 
-    async def events_renew(
-        self, *, subscription_url: str, termination_time: str = "PT60S"
-    ) -> None:
+    async def events_renew(self, *, subscription_url: str, termination_time: str = "PT60S") -> None:
         """Renew a subscription's termination time."""
         await self._post_subscription(
             subscription_url=subscription_url,

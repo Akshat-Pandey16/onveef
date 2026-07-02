@@ -70,12 +70,10 @@ def test_lazy_auto_discovery_from_host_form() -> None:
         "</GetServicesResponse>"
     )
     profiles_xml = (
-        "<GetProfilesResponse><Profiles token=\"P0\"><Name>Main</Name></Profiles>"
+        '<GetProfilesResponse><Profiles token="P0"><Name>Main</Name></Profiles>'
         "</GetProfilesResponse>"
     )
-    sent = _stub_by_operation(
-        client, {"GetServices": services_xml, "GetProfiles": profiles_xml}
-    )
+    sent = _stub_by_operation(client, {"GetServices": services_xml, "GetProfiles": profiles_xml})
     profiles = client.get_profiles()
     client.close()
     assert profiles[0]["token"] == "P0"
@@ -110,13 +108,13 @@ def test_parse_services_discovers_analytics_ver20() -> None:
 def test_parse_profiles_media2_attribute_video_encoder() -> None:
     xml = (
         "<GetProfilesResponse>"
-        "<Profiles token=\"P0\" fixed=\"true\"><Name>MainStream</Name>"
+        '<Profiles token="P0" fixed="true"><Name>MainStream</Name>'
         "<Configurations>"
-        "<VideoEncoder token=\"VE0\" GovLength=\"30\" Profile=\"High\" Encoding=\"H264\">"
+        '<VideoEncoder token="VE0" GovLength="30" Profile="High" Encoding="H264">'
         "<Name>VE</Name>"
         "<Resolution><Width>1920</Width><Height>1080</Height></Resolution>"
         "<Quality>4</Quality>"
-        "<RateControl FrameRateLimit=\"25\" BitrateLimit=\"4096\" EncodingInterval=\"1\"/>"
+        '<RateControl FrameRateLimit="25" BitrateLimit="4096" EncodingInterval="1"/>'
         "</VideoEncoder>"
         "</Configurations>"
         "</Profiles>"
@@ -137,7 +135,7 @@ def test_parse_profiles_media2_attribute_video_encoder() -> None:
 
 def test_parse_fault_soap11_faultstring() -> None:
     xml = (
-        "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">"
+        '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
         "<soap:Body><soap:Fault>"
         "<faultcode>soap:Server</faultcode>"
         "<faultstring>Optional action is not implemented</faultstring>"
@@ -150,14 +148,14 @@ def test_parse_fault_soap11_faultstring() -> None:
 
 def test_parse_pull_messages_extracts_times_deep() -> None:
     xml = (
-        "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\">"
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
         "<s:Body><PullMessagesResponse>"
         "<CurrentTime>2026-07-02T12:00:00Z</CurrentTime>"
         "<TerminationTime>2026-07-02T12:05:00Z</TerminationTime>"
         "<NotificationMessage><Topic>tns1:VideoSource/MotionAlarm</Topic>"
-        "<Message><Message UtcTime=\"2026-07-02T12:00:01Z\" PropertyOperation=\"Changed\">"
-        "<Source><SimpleItem Name=\"VideoSourceToken\" Value=\"VS0\"/></Source>"
-        "<Data><SimpleItem Name=\"State\" Value=\"true\"/></Data>"
+        '<Message><Message UtcTime="2026-07-02T12:00:01Z" PropertyOperation="Changed">'
+        '<Source><SimpleItem Name="VideoSourceToken" Value="VS0"/></Source>'
+        '<Data><SimpleItem Name="State" Value="true"/></Data>'
         "</Message></Message></NotificationMessage>"
         "</PullMessagesResponse></s:Body></s:Envelope>"
     )
@@ -169,7 +167,7 @@ def test_parse_pull_messages_extracts_times_deep() -> None:
 
 def test_parse_create_pull_point_extracts_times_deep() -> None:
     xml = (
-        "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\">"
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
         "<s:Body><CreatePullPointSubscriptionResponse>"
         "<SubscriptionReference><Address>http://cam/onvif/sub/0</Address></SubscriptionReference>"
         "<CurrentTime>2026-07-02T12:00:00Z</CurrentTime>"
@@ -184,7 +182,7 @@ def test_parse_create_pull_point_extracts_times_deep() -> None:
 
 def test_parse_event_properties_keeps_tns1_prefix() -> None:
     xml = (
-        "<GetEventPropertiesResponse xmlns:tns1=\"http://www.onvif.org/ver10/topics\">"
+        '<GetEventPropertiesResponse xmlns:tns1="http://www.onvif.org/ver10/topics">'
         "<TopicSet>"
         "<tns1:VideoSource><MotionAlarm><MessageDescription/></MotionAlarm></tns1:VideoSource>"
         "</TopicSet></GetEventPropertiesResponse>"

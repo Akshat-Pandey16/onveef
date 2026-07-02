@@ -1,0 +1,45 @@
+name: Bump version
+
+on:
+  workflow_dispatch:
+    inputs:
+      increment:
+        description: "Force a bump size (leave as auto to detect from commits)"
+        required: false
+        default: "auto"
+        type: choice
+        options: ["auto", "PATCH", "MINOR", "MAJOR"]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version, update changelog, and tag
+        run: |
+          if [ "${{ inputs.increment }}" = "auto" ]; then
+            uv run cz bump --yes
+          else
+            uv run cz bump --yes --increment "${{ inputs.increment }}"
+          fi
+
+      - name: Push commit and tag
+        run: git push --follow-tags origin HEAD:main
