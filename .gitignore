@@ -7,3 +7,11 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# mkdocs build output
+site/

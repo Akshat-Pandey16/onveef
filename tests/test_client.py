@@ -29,7 +29,13 @@ def _client(services: dict[str, str] | None = None) -> OnvifClient:
 def _stub(client: OnvifClient, xml: str) -> list[str]:
     captured: list[str] = []
 
-    def fake_post_soap(*, url: str, envelope: str, content_type: str) -> tuple[int, str]:
+    def fake_post_soap(
+        *,
+        url: str,
+        envelope: str,
+        content_type: str,
+        read_timeout_s: float | None = None,
+    ) -> tuple[int, str]:
         captured.append(envelope)
         return 200, xml
 

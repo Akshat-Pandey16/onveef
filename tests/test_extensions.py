@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import pytest
+
 from onveef import envelopes, parsers
 from onveef.client import OnvifClient, OnvifCredentials, OnvifEndpoint
+from onveef.exceptions import OnvifAuthError
 
 _ALL_SERVICES = {
     "device": "http://cam/onvif/device_service",
@@ -14,7 +17,10 @@ _ALL_SERVICES = {
 
 
 def _client(
-    services: dict[str, str] | None = None, *, creds: OnvifCredentials | None = None
+    services: dict[str, str] | None = None,
+    *,
+    creds: OnvifCredentials | None = None,
+    password_text_fallback: bool = False,
 ) -> OnvifClient:
     return OnvifClient(
         endpoint=OnvifEndpoint(
@@ -22,13 +28,20 @@ def _client(
             services=_ALL_SERVICES if services is None else services,
         ),
         credentials=creds or OnvifCredentials(),
+        password_text_fallback=password_text_fallback,
     )
 
 
 def _stub(client: OnvifClient, responder: Callable[[str], tuple[int, str]]) -> list[str]:
     captured: list[str] = []
 
-    def fake_post_soap(*, url: str, envelope: str, content_type: str) -> tuple[int, str]:
+    def fake_post_soap(
+        *,
+        url: str,
+        envelope: str,
+        content_type: str,
+        read_timeout_s: float | None = None,
+    ) -> tuple[int, str]:
         captured.append(envelope)
         return responder(envelope)
 
@@ -163,8 +176,8 @@ def test_client_relay_output_options_routes_to_deviceio() -> None:
 
 
 def test_password_text_fallback_after_digest_401() -> None:
-    """The digest-401 path retries once with PasswordText; clock sync is pinned off here."""
-    client = _client(creds=OnvifCredentials("admin", "pw"))
+    """Opting in to the plaintext fallback retries a digest 401 once with PasswordText."""
+    client = _client(creds=OnvifCredentials("admin", "pw"), password_text_fallback=True)
     client._clock_synced = True
 
     def responder(envelope: str) -> tuple[int, str]:
@@ -176,3 +189,13 @@ def test_password_text_fallback_after_digest_401() -> None:
     assert client.get_hostname() == "cam"
     assert any("PasswordDigest" in e for e in sent)
     assert any("PasswordText" in e for e in sent)
+
+
+def test_password_text_fallback_is_off_by_default() -> None:
+    """A digest 401 must not silently downgrade to a plaintext password."""
+    client = _client(creds=OnvifCredentials("admin", "pw"))
+    client._clock_synced = True
+    sent = _stub(client, lambda _e: (401, ""))
+    with pytest.raises(OnvifAuthError):
+        client.get_hostname()
+    assert not any("PasswordText" in e for e in sent)

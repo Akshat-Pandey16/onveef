@@ -29,13 +29,13 @@ class CircuitBreaker:
     def __init__(
         self,
         *,
-        window_s: float = _WINDOW_S,
-        threshold: int = _THRESHOLD,
-        open_s: float = _OPEN_S,
+        window_s: float | None = None,
+        threshold: int | None = None,
+        open_s: float | None = None,
     ) -> None:
-        self.window_s = window_s
-        self.threshold = threshold
-        self.open_s = open_s
+        self.window_s = _WINDOW_S if window_s is None else window_s
+        self.threshold = _THRESHOLD if threshold is None else threshold
+        self.open_s = _OPEN_S if open_s is None else open_s
         self._lock = threading.Lock()
         self._failures: dict[str, list[float]] = {}
         self._open_until: dict[str, float] = {}
@@ -111,7 +111,7 @@ def configure(
     threshold: int | None = None,
     open_s: float | None = None,
 ) -> None:
-    """Configure the process-wide default circuit breaker."""
+    """Configure the process-wide default breaker and the defaults new instances inherit."""
     global _WINDOW_S, _THRESHOLD, _OPEN_S
     if window_s is not None:
         _WINDOW_S = window_s

@@ -5,14 +5,19 @@ from __future__ import annotations
 import logging
 import random
 import re
+import ssl
+import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from importlib import metadata
+from types import TracebackType
 from typing import Any
 
 import httpx
 
-from onveef import breaker, envelopes, pacs, parsers
+from onveef import breaker, envelopes, pacs, parsers, urls
 from onveef.exceptions import (
     OnvifAuthError,
     OnvifCapabilityMissingError,
@@ -27,8 +32,17 @@ from onveef.exceptions import (
 
 logger = logging.getLogger("onveef")
 
+
+def _package_version() -> str:
+    """Return the installed package version, or ``0`` when running from a bare checkout."""
+    try:
+        return metadata.version("onveef")
+    except metadata.PackageNotFoundError:
+        return "0"
+
+
 DEFAULT_TIMEOUT_S = 5.0
-DEFAULT_USER_AGENT = "onveef/0.4"
+DEFAULT_USER_AGENT = f"onveef/{_package_version()}"
 DEFAULT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _MAX_RESPONSE_BYTES = DEFAULT_MAX_RESPONSE_BYTES
 _DEFAULT_DEVICE_PATH = "/onvif/device_service"
@@ -147,14 +161,23 @@ class OnvifClient:
         auto_discover: Discover per-service endpoints lazily on first use. Defaults to
             ``True`` for the host form and ``False`` for the ``endpoint=`` form.
         timeout_s: Default timeout applied to connect/read/write/pool.
-        connect_timeout_s / read_timeout_s: Override individual phases (e.g. a longer read).
-        verify_tls: Verify TLS certificates. Set ``False`` for cameras with self-signed certs.
+        connect_timeout_s: Override the connect phase timeout.
+        read_timeout_s: Override the read phase timeout (e.g. a longer read).
+        verify_tls: Verify TLS certificates. Accepts ``False`` for cameras with self-signed
+            certs, or a CA-bundle path / :class:`ssl.SSLContext` to pin one properly.
+        rewrite_host: Re-point every address the device reports about itself (service
+            XAddrs, subscription references, stream and snapshot URIs) at the host you
+            actually connected to. Devices behind NAT, a port forward or a Docker bridge
+            advertise their own unreachable address; leave this on unless you have a
+            device whose services genuinely live on another host. See :mod:`onveef.urls`.
         breaker_key: Enable a per-client circuit breaker keyed by this id. Omit to disable.
-        breaker_window_s / breaker_threshold / breaker_open_s: Circuit-breaker tuning.
+        breaker_window_s: Sliding window over which failures are counted.
+        breaker_threshold: Failures within the window that trip the breaker.
+        breaker_open_s: How long the breaker stays open before a half-open probe.
         password_text: Always send the WS-Security password as plaintext ``PasswordText``.
-        password_text_fallback: On a digest ``401``, retry once with ``PasswordText`` (some
-            cheap firmware only accepts plaintext). A warning is logged when this triggers,
-            and it is **plaintext over the wire** on non-HTTPS transports.
+        password_text_fallback: On a digest ``401``, retry once with ``PasswordText``. Some
+            cheap firmware only accepts plaintext, but this sends **the password in the
+            clear** on non-HTTPS transports, so it is off by default; opt in per device.
         ws_timestamp: Add a ``<wsu:Timestamp>`` to the security header (some strict devices).
         http_auth: HTTP transport auth to try when a device answers ``401`` with a
             ``WWW-Authenticate`` challenge — ``"auto"`` (Digest then Basic), ``"digest"``,
@@ -162,6 +185,11 @@ class OnvifClient:
         retries: Automatic retries for transient failures on idempotent (read) operations.
         max_response_bytes: Hard cap on a single SOAP response body.
         user_agent: HTTP ``User-Agent`` header.
+        transport: Custom :class:`httpx.BaseTransport` — e.g. ``httpx.MockTransport`` in
+            tests, or a transport with bespoke connection limits.
+        proxy: Proxy URL passed through to ``httpx``.
+        http_client: Bring your own :class:`httpx.Client` (connection pooling shared with
+            the rest of your application). You own its lifetime — ``close()`` leaves it open.
     """
 
     def __init__(
@@ -179,18 +207,22 @@ class OnvifClient:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         connect_timeout_s: float | None = None,
         read_timeout_s: float | None = None,
-        verify_tls: bool = True,
+        verify_tls: bool | str | ssl.SSLContext = True,
+        rewrite_host: bool = True,
         breaker_key: str | None = None,
         breaker_window_s: float = 60.0,
         breaker_threshold: int = 3,
         breaker_open_s: float = 30.0,
         password_text: bool = False,
-        password_text_fallback: bool = True,
+        password_text_fallback: bool = False,
         ws_timestamp: bool = False,
         http_auth: str = "auto",
         retries: int = 2,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         user_agent: str = DEFAULT_USER_AGENT,
+        transport: httpx.BaseTransport | None = None,
+        proxy: str | None = None,
+        http_client: httpx.Client | None = None,
     ) -> None:
         if endpoint is None:
             if not host:
@@ -230,27 +262,55 @@ class OnvifClient:
         self._password_text_fallback = password_text_fallback
         self._ws_timestamp = ws_timestamp
         self._auto_discover = auto_discover
+        self._rewrite_host = rewrite_host
         self._discovered = False
         self._clock_offset_s = 0.0
         self._clock_synced = False
         self._clock_syncing = False
-        self._read_override_s: float | None = None
-        self._client = httpx.Client(
+        self._discover_lock = threading.RLock()
+        self._clock_lock = threading.RLock()
+        self._owns_client = http_client is None
+        self._client = http_client or httpx.Client(
             timeout=self._timeout,
             verify=verify_tls,
             headers={"User-Agent": user_agent},
             follow_redirects=False,
+            transport=transport,
+            proxy=proxy,
         )
 
     def __enter__(self) -> OnvifClient:
         return self
 
-    def __exit__(self, *_exc: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def close(self) -> None:
-        """Close the underlying HTTP connection pool."""
-        self._client.close()
+        """Close the underlying HTTP connection pool, unless it was supplied by the caller."""
+        if self._owns_client:
+            self._client.close()
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(device_xaddr={self._endpoint.device_xaddr!r}, "
+            f"username={self._credentials.username!r}, "
+            f"services={sorted(self._endpoint.services)})"
+        )
+
+    def local_address(self) -> str:
+        """Return the host this client connects to, used as the host-rewrite reference."""
+        return urls.host_of(self._endpoint.device_xaddr)
+
+    def _fix_url(self, url: str) -> str:
+        """Re-point a device-reported URL at the address we reached the device on."""
+        if not self._rewrite_host:
+            return url
+        return urls.rewrite_host(url, self._endpoint.device_xaddr)
 
     @property
     def endpoint(self) -> OnvifEndpoint:
@@ -278,14 +338,18 @@ class OnvifClient:
     def _discover_once(self) -> None:
         if self._discovered:
             return
-        self._discovered = True
-        try:
-            services = self.discover_services()
-        except OnvifError:
-            return
-        if services:
-            merged = {**services, **{k: v for k, v in self._endpoint.services.items() if v}}
-            self._endpoint = OnvifEndpoint(self._endpoint.device_xaddr, services=merged)
+        with self._discover_lock:
+            if self._discovered:
+                return
+            try:
+                services = self.discover_services()
+            except OnvifError:
+                services = {}
+            finally:
+                self._discovered = True
+            if services:
+                merged = {**services, **{k: v for k, v in self._endpoint.services.items() if v}}
+                self._endpoint = OnvifEndpoint(self._endpoint.device_xaddr, services=merged)
 
     def _has(self, service: str) -> bool:
         """Whether the device advertises ``service``, running auto-discovery first if needed."""
@@ -339,12 +403,18 @@ class OnvifClient:
         return None
 
     def _raw_post(
-        self, *, url: str, content_type: str, envelope: str, auth: httpx.Auth | None
+        self,
+        *,
+        url: str,
+        content_type: str,
+        envelope: str,
+        auth: httpx.Auth | None,
+        read_timeout_s: float | None,
     ) -> tuple[int, str, str]:
         timeout = (
             self._timeout
-            if self._read_override_s is None
-            else httpx.Timeout(self._timeout, read=self._read_override_s)
+            if read_timeout_s is None
+            else httpx.Timeout(self._timeout, read=read_timeout_s)
         )
         with self._client.stream(
             "POST",
@@ -368,15 +438,30 @@ class OnvifClient:
                 text = bytes(body).decode("utf-8", errors="replace")
             return response.status_code, text, response.headers.get("WWW-Authenticate", "")
 
-    def _post_soap(self, *, url: str, envelope: str, content_type: str) -> tuple[int, str]:
+    def _post_soap(
+        self,
+        *,
+        url: str,
+        envelope: str,
+        content_type: str,
+        read_timeout_s: float | None = None,
+    ) -> tuple[int, str]:
         status, text, challenge = self._raw_post(
-            url=url, content_type=content_type, envelope=envelope, auth=None
+            url=url,
+            content_type=content_type,
+            envelope=envelope,
+            auth=None,
+            read_timeout_s=read_timeout_s,
         )
         if status == 401:
             auth = self._http_auth_for(challenge)
             if auth is not None:
                 status, text, _ = self._raw_post(
-                    url=url, content_type=content_type, envelope=envelope, auth=auth
+                    url=url,
+                    content_type=content_type,
+                    envelope=envelope,
+                    auth=auth,
+                    read_timeout_s=read_timeout_s,
                 )
         return status, text
 
@@ -384,14 +469,21 @@ class OnvifClient:
         jitter = 0.5 + random.random()
         return float(min(2.0, 0.25 * (2**attempt)) * jitter)
 
-    def _send_cycle(self, *, xaddr: str, operation: str, envelope: str) -> str:
+    def _send_cycle(
+        self, *, xaddr: str, operation: str, envelope: str, read_timeout_s: float | None = None
+    ) -> str:
         last_status = 0
         last_text = ""
         for ct in _CONTENT_TYPES:
             try:
-                status, text = self._post_soap(url=xaddr, envelope=envelope, content_type=ct)
+                status, text = self._post_soap(
+                    url=xaddr,
+                    envelope=envelope,
+                    content_type=ct,
+                    read_timeout_s=read_timeout_s,
+                )
             except httpx.TimeoutException as exc:
-                if self._read_override_s is None:
+                if read_timeout_s is None:
                     self._record_failure()
                 raise OnvifTimeoutError(f"ONVIF call '{operation}' timed out: {exc}") from exc
             except httpx.HTTPError as exc:
@@ -447,6 +539,7 @@ class OnvifClient:
         body_inner: str,
         with_auth: bool,
         password_text: bool | None = None,
+        read_timeout_s: float | None = None,
     ) -> str:
         if self._breaker_open():
             raise OnvifTransportError(
@@ -454,7 +547,7 @@ class OnvifClient:
                 "(recent transport failures)."
             )
         text_mode = self._password_text if password_text is None else password_text
-        long_poll = self._read_override_s is not None
+        long_poll = read_timeout_s is not None
         max_attempts = 1 if long_poll or not _is_idempotent(operation) else self._retries + 1
         transient: OnvifError | None = None
         for attempt in range(max_attempts):
@@ -467,7 +560,12 @@ class OnvifClient:
                 add_timestamp=self._ws_timestamp if with_auth else False,
             )
             try:
-                return self._send_cycle(xaddr=xaddr, operation=operation, envelope=envelope)
+                return self._send_cycle(
+                    xaddr=xaddr,
+                    operation=operation,
+                    envelope=envelope,
+                    read_timeout_s=read_timeout_s,
+                )
             except (OnvifTimeoutError, OnvifServiceUnavailableError) as exc:
                 transient = exc
             except OnvifTransportError as exc:
@@ -492,6 +590,7 @@ class OnvifClient:
         operation: str,
         body_inner: str,
         require_auth: bool | None = None,
+        read_timeout_s: float | None = None,
     ) -> str:
         """Send one SOAP operation and return the raw response XML (advanced/escape hatch).
 
@@ -504,6 +603,9 @@ class OnvifClient:
             operation: ONVIF operation name (for logging and idempotency detection).
             body_inner: The SOAP ``Body`` inner XML (see :mod:`onveef.envelopes`).
             require_auth: Force auth on/off; ``None`` decides automatically.
+            read_timeout_s: Override the read timeout for this one request (used by
+                long-polling operations). Retries are disabled when it is set, and the
+                override never leaks into other requests sharing this client.
         """
         xaddr = self.require(service)
         wants_auth = self._credentials.configured
@@ -520,6 +622,7 @@ class OnvifClient:
                     operation=operation,
                     body_inner=body_inner,
                     with_auth=False,
+                    read_timeout_s=read_timeout_s,
                 )
             except OnvifAuthError:
                 if not self._credentials.configured:
@@ -530,6 +633,7 @@ class OnvifClient:
                 operation=operation,
                 body_inner=body_inner,
                 with_auth=True,
+                read_timeout_s=read_timeout_s,
             )
         except OnvifAuthError:
             if not self._credentials.configured:
@@ -543,6 +647,7 @@ class OnvifClient:
                             operation=operation,
                             body_inner=body_inner,
                             with_auth=True,
+                            read_timeout_s=read_timeout_s,
                         )
                     except OnvifAuthError:
                         pass
@@ -560,41 +665,45 @@ class OnvifClient:
                     body_inner=body_inner,
                     with_auth=True,
                     password_text=True,
+                    read_timeout_s=read_timeout_s,
                 )
             raise
 
     def _sync_clock_offset(self) -> None:
         if self._clock_synced or self._clock_syncing:
             return
-        self._clock_syncing = True
-        try:
-            info = self.get_system_date_time()
-        except (
-            OnvifAuthError,
-            OnvifFaultError,
-            OnvifTransportError,
-            OnvifCapabilityMissingError,
-        ):
-            return
-        finally:
-            self._clock_syncing = False
-        utc = info.get("UTCDateTime")
-        if not isinstance(utc, dict):
-            return
-        try:
-            device_utc = datetime(
-                utc["year"],
-                utc["month"],
-                utc["day"],
-                utc["hour"],
-                utc["minute"],
-                utc["second"],
-                tzinfo=UTC,
-            )
-        except (KeyError, ValueError, TypeError):
-            return
-        self._clock_offset_s = (device_utc - datetime.now(UTC)).total_seconds()
-        self._clock_synced = True
+        with self._clock_lock:
+            if self._clock_synced or self._clock_syncing:
+                return
+            self._clock_syncing = True
+            try:
+                info = self.get_system_date_time()
+            except (
+                OnvifAuthError,
+                OnvifFaultError,
+                OnvifTransportError,
+                OnvifCapabilityMissingError,
+            ):
+                return
+            finally:
+                self._clock_syncing = False
+            utc = info.get("UTCDateTime")
+            if not isinstance(utc, dict):
+                return
+            try:
+                device_utc = datetime(
+                    utc["year"],
+                    utc["month"],
+                    utc["day"],
+                    utc["hour"],
+                    utc["minute"],
+                    utc["second"],
+                    tzinfo=UTC,
+                )
+            except (KeyError, ValueError, TypeError):
+                return
+            self._clock_offset_s = (device_utc - datetime.now(UTC)).total_seconds()
+            self._clock_synced = True
 
     def get_device_information(self) -> dict[str, str]:
         """Return the ONVIF ``GetDeviceInformation`` result from the Device service, parsed by ``parsers.parse_device_information`` into ``dict[str, str]``."""
@@ -624,14 +733,21 @@ class OnvifClient:
         return parsers.parse_services(xml)
 
     def discover_services(self) -> dict[str, str]:
-        """Return the device's service-to-XAddr map, trying ``GetServices`` first and falling back to ``GetCapabilities``."""
+        """Return the device's service-to-XAddr map, trying ``GetServices`` first and falling back to ``GetCapabilities``.
+
+        Unless ``rewrite_host=False`` was passed, every XAddr is re-pointed at the address
+        this client reached the device on, so devices that advertise their own unreachable
+        address (NAT, port forward, Docker bridge, stale DHCP lease) still work.
+        """
         try:
             services = self.get_services()
-            if services:
-                return services
+            if not services:
+                services = self.get_capabilities()
         except OnvifFaultError:
-            services = {}
-        return self.get_capabilities()
+            services = self.get_capabilities()
+        if not self._rewrite_host:
+            return services
+        return urls.rewrite_service_map(services, self._endpoint.device_xaddr)
 
     def get_system_date_time(self) -> dict[str, Any]:
         """Return the ONVIF ``GetSystemDateAndTime`` result from the Device service, parsed by ``parsers.parse_system_datetime`` into ``dict[str, Any]``."""
@@ -945,8 +1061,22 @@ class OnvifClient:
         stream: str = "RTP-Unicast",
         protocol: str = "RTSP",
         protocol2: str = "RtspUnicast",
+        with_credentials: bool = False,
     ) -> str:
-        """Return the ONVIF ``GetStreamUri`` result from the Media service, parsed by ``parsers.parse_stream_uri`` into ``str``."""
+        """Return the RTSP stream URI for a profile.
+
+        The host is rewritten to the address this client reached the device on (unless
+        ``rewrite_host=False``), because cameras habitually report their own LAN address.
+
+        Args:
+            profile_token: The media profile to stream.
+            stream: Media1 ``StreamSetup`` stream type.
+            protocol: Media1 transport protocol.
+            protocol2: Media2 transport protocol.
+            with_credentials: Embed this client's percent-encoded username and password in
+                the URI, which is what ffmpeg, OpenCV, GStreamer and go2rtc expect. Note
+                this puts the password in a string that is easy to log by accident.
+        """
         service, use_media2 = self._media_service()
         xml = self.call(
             service=service,
@@ -959,10 +1089,18 @@ class OnvifClient:
                 protocol2=protocol2,
             ),
         )
-        return parsers.parse_stream_uri(xml)
+        uri = self._fix_url(parsers.parse_stream_uri(xml))
+        if with_credentials:
+            return urls.with_credentials(
+                uri, self._credentials.username, self._credentials.password
+            )
+        return uri
 
-    def get_snapshot_uri(self, *, profile_token: str) -> str:
-        """Return the ONVIF ``GetSnapshotUri`` result from the Media service, parsed by ``parsers.parse_snapshot_uri`` into ``str``."""
+    def get_snapshot_uri(self, *, profile_token: str, with_credentials: bool = False) -> str:
+        """Return the JPEG snapshot URI for a profile, host-rewritten like the stream URI.
+
+        Pass ``with_credentials=True`` to embed percent-encoded credentials in the URI.
+        """
         service, use_media2 = self._media_service()
         xml = self.call(
             service=service,
@@ -971,7 +1109,12 @@ class OnvifClient:
                 profile_token=profile_token, use_media2=use_media2
             ),
         )
-        return parsers.parse_snapshot_uri(xml)
+        uri = self._fix_url(parsers.parse_snapshot_uri(xml))
+        if with_credentials:
+            return urls.with_credentials(
+                uri, self._credentials.username, self._credentials.password
+            )
+        return uri
 
     def get_snapshot(self, *, profile_token: str) -> tuple[bytes, str]:
         """Fetch a JPEG snapshot for a profile as ``(image_bytes, content_type)``.
@@ -1498,6 +1641,23 @@ class OnvifClient:
             "GetVideoEncoderConfigurationOptions requires a Media or Media2 service."
         )
 
+    def get_video_encoder_options_normalized(
+        self, *, configuration_token: str = "", profile_token: str = "", prefer: str = "auto"
+    ) -> list[dict[str, Any]]:
+        """Return encoder options normalized into one shape across Media1 and Media2.
+
+        Media1 and Media2 describe the same capabilities with different element names and
+        attribute-vs-element layouts. This flattens both into a list of per-encoding dicts
+        (``encoding``, ``resolutions``, ``fps``, ``bitrate_kbps``, ``gop``, ``quality``,
+        ``profiles``), which is what you want when building an encoder-settings UI.
+        """
+        _service, xml = self.get_video_encoder_options_raw(
+            configuration_token=configuration_token,
+            profile_token=profile_token,
+            prefer=prefer,
+        )
+        return parsers.parse_video_encoder_options_normalized(xml)
+
     def set_video_encoder_configuration_media2(
         self,
         *,
@@ -1655,7 +1815,12 @@ class OnvifClient:
     def events_create_pull_point(
         self, *, termination_time: str = "PT60S", topic_filter: str = ""
     ) -> dict[str, Any]:
-        """Return the ONVIF ``CreatePullPointSubscription`` result from the Events service, parsed by ``parsers.parse_create_pull_point`` into ``dict[str, Any]``."""
+        """Create a pull-point subscription and return its reference and termination times.
+
+        The ``subscription_url`` the device returns is host-rewritten like any other
+        device-reported address, so it stays reachable across NAT and port forwards.
+        Prefer :meth:`pull_point`, which keeps the subscription alive for you.
+        """
         xml = self.call(
             service="events",
             operation="CreatePullPointSubscription",
@@ -1663,10 +1828,52 @@ class OnvifClient:
                 termination_time=termination_time, topic_filter=topic_filter
             ),
         )
-        return parsers.parse_create_pull_point(xml)
+        result = parsers.parse_create_pull_point(xml)
+        if result.get("subscription_url"):
+            result["subscription_url"] = self._fix_url(str(result["subscription_url"]))
+        return result
+
+    def pull_point(
+        self,
+        *,
+        termination_time: str = "PT60S",
+        topic_filter: str = "",
+        timeout: str = "PT5S",
+        message_limit: int = 20,
+        auto_renew: bool = True,
+    ) -> PullPointSubscription:
+        """Return a managed pull-point subscription that renews and cleans up after itself.
+
+        A raw pull-point expires at its ``termination_time`` and has to be renewed on a
+        clock you maintain. This wrapper renews at half the termination interval, transparently
+        re-creates the subscription if the device drops it, and unsubscribes on exit::
+
+            with cam.pull_point(topic_filter="tns1:RuleEngine//.") as sub:
+                for message in sub:
+                    print(message["topic"], message["data"])
+
+        Iteration blocks in the device's own long poll, so it costs one request per
+        ``timeout`` interval rather than a busy loop.
+        """
+        subscription = PullPointSubscription(
+            self,
+            termination_time=termination_time,
+            topic_filter=topic_filter,
+            timeout=timeout,
+            message_limit=message_limit,
+            auto_renew=auto_renew,
+        )
+        subscription.create()
+        return subscription
 
     def _post_subscription(
-        self, *, subscription_url: str, body: str, wsa_action: str, operation: str
+        self,
+        *,
+        subscription_url: str,
+        body: str,
+        wsa_action: str,
+        operation: str,
+        read_timeout_s: float | None = None,
     ) -> str:
         def build() -> str:
             return envelopes.build_envelope(
@@ -1681,14 +1888,24 @@ class OnvifClient:
             )
 
         try:
-            return self._post_xml(url=subscription_url, envelope=build(), operation=operation)
+            return self._post_xml(
+                url=subscription_url,
+                envelope=build(),
+                operation=operation,
+                read_timeout_s=read_timeout_s,
+            )
         except OnvifAuthError:
             if self._clock_synced or not self._credentials.configured:
                 raise
             self._sync_clock_offset()
             if self._clock_offset_s == 0.0:
                 raise
-            return self._post_xml(url=subscription_url, envelope=build(), operation=operation)
+            return self._post_xml(
+                url=subscription_url,
+                envelope=build(),
+                operation=operation,
+                read_timeout_s=read_timeout_s,
+            )
 
     def events_pull_messages(
         self,
@@ -1698,19 +1915,15 @@ class OnvifClient:
         message_limit: int = 20,
     ) -> dict[str, Any]:
         """Pull queued notifications from a PullPoint ``subscription_url`` and return the parsed messages and termination times as a dict."""
-        prev_override = self._read_override_s
-        self._read_override_s = _iso8601_seconds(timeout, 5.0) + 5.0
-        try:
-            xml = self._post_subscription(
-                subscription_url=subscription_url,
-                body=envelopes.events_pull_messages(timeout=timeout, message_limit=message_limit),
-                wsa_action=(
-                    "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest"
-                ),
-                operation="PullMessages",
-            )
-        finally:
-            self._read_override_s = prev_override
+        xml = self._post_subscription(
+            subscription_url=subscription_url,
+            body=envelopes.events_pull_messages(timeout=timeout, message_limit=message_limit),
+            wsa_action=(
+                "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest"
+            ),
+            operation="PullMessages",
+            read_timeout_s=_iso8601_seconds(timeout, 5.0) + 5.0,
+        )
         return parsers.parse_pull_messages(xml)
 
     def events_renew(self, *, subscription_url: str, termination_time: str = "PT60S") -> None:
@@ -1731,13 +1944,17 @@ class OnvifClient:
             operation="Unsubscribe",
         )
 
-    def _post_xml(self, *, url: str, envelope: str, operation: str) -> str:
+    def _post_xml(
+        self, *, url: str, envelope: str, operation: str, read_timeout_s: float | None = None
+    ) -> str:
         if self._breaker_open():
             raise OnvifTransportError(
                 f"ONVIF call '{operation}' skipped: device circuit breaker open "
                 "(recent transport failures)."
             )
-        return self._send_cycle(xaddr=url, operation=operation, envelope=envelope)
+        return self._send_cycle(
+            xaddr=url, operation=operation, envelope=envelope, read_timeout_s=read_timeout_s
+        )
 
     def _require_media1(self, operation: str) -> None:
         if not self._has("media"):
@@ -2085,8 +2302,12 @@ class OnvifClient:
         recording_token: str,
         stream: str = "RTP-Unicast",
         protocol: str = "RTSP",
+        with_credentials: bool = False,
     ) -> str:
-        """Return the ONVIF ``GetReplayUri`` result from the Replay service, parsed by ``parsers.parse_stream_uri`` into ``str``."""
+        """Return the replay RTSP URI for a recording, host-rewritten like the live stream URI.
+
+        Pass ``with_credentials=True`` to embed percent-encoded credentials in the URI.
+        """
         xml = self.call(
             service="replay",
             operation="GetReplayUri",
@@ -2094,7 +2315,12 @@ class OnvifClient:
                 recording_token=recording_token, stream=stream, protocol=protocol
             ),
         )
-        return parsers.parse_stream_uri(xml)
+        uri = self._fix_url(parsers.parse_stream_uri(xml))
+        if with_credentials:
+            return urls.with_credentials(
+                uri, self._credentials.username, self._credentials.password
+            )
+        return uri
 
     def get_replay_configuration(self) -> dict[str, Any]:
         """Return the ONVIF ``GetReplayConfiguration`` result from the Replay service, parsed by ``parsers.parse_replay_configuration`` into ``dict[str, Any]``."""
@@ -2143,23 +2369,101 @@ class OnvifClient:
         )
         return parsers.parse_osd_options(xml)
 
-    def create_osd(self, **kwargs: Any) -> str:
-        """Return the ONVIF ``CreateOSD`` result from the Media service, parsed by ``parsers.parse_created_token`` into ``str``."""
+    def create_osd(
+        self,
+        *,
+        video_source_configuration_token: str,
+        osd_type: str = "Text",
+        position_type: str = "UpperLeft",
+        pos_x: float | None = None,
+        pos_y: float | None = None,
+        text_type: str = "Plain",
+        plain_text: str = "",
+        font_size: int | None = None,
+        date_format: str = "",
+        time_format: str = "",
+    ) -> str:
+        """Create an on-screen display overlay (legacy Media service).
+
+        Args:
+            video_source_configuration_token: The video source the OSD is drawn on.
+            osd_type: ``Text`` or ``Image``.
+            position_type: ``UpperLeft``, ``UpperRight``, ``LowerLeft``, ``LowerRight`` or
+                ``Custom`` — ``Custom`` uses ``pos_x``/``pos_y``.
+            pos_x: Normalised -1..1 horizontal position, used only for ``Custom``.
+            pos_y: Normalised -1..1 vertical position, used only for ``Custom``.
+            text_type: ``Plain``, ``Date``, ``Time`` or ``DateAndTime``.
+            plain_text: The text drawn when ``text_type`` is ``Plain``.
+            font_size: Font size in points; omitted when ``None``.
+            date_format: Device-specific date format string.
+            time_format: Device-specific time format string.
+        """
         self._require_media1("CreateOSD")
         xml = self.call(
             service="media",
             operation="CreateOSD",
-            body_inner=envelopes.media_create_osd(**kwargs),
+            body_inner=envelopes.media_create_osd(
+                video_source_configuration_token=video_source_configuration_token,
+                osd_type=osd_type,
+                position_type=position_type,
+                pos_x=pos_x,
+                pos_y=pos_y,
+                text_type=text_type,
+                plain_text=plain_text,
+                font_size=font_size,
+                date_format=date_format,
+                time_format=time_format,
+            ),
         )
         return parsers.parse_created_token(xml, tag="OSDToken")
 
-    def set_osd(self, **kwargs: Any) -> None:
-        """Send the ONVIF ``SetOSD`` request to the Media service."""
+    def set_osd(
+        self,
+        *,
+        osd_token: str,
+        video_source_configuration_token: str,
+        osd_type: str = "Text",
+        position_type: str = "UpperLeft",
+        pos_x: float | None = None,
+        pos_y: float | None = None,
+        text_type: str = "Plain",
+        plain_text: str = "",
+        font_size: int | None = None,
+        date_format: str = "",
+        time_format: str = "",
+    ) -> None:
+        """Update an on-screen display overlay (legacy Media service).
+
+        Args:
+            osd_token: The OSD to update.\n            video_source_configuration_token: The video source the OSD is drawn on.
+            osd_type: ``Text`` or ``Image``.
+            position_type: ``UpperLeft``, ``UpperRight``, ``LowerLeft``, ``LowerRight`` or
+                ``Custom`` — ``Custom`` uses ``pos_x``/``pos_y``.
+            pos_x: Normalised -1..1 horizontal position, used only for ``Custom``.
+            pos_y: Normalised -1..1 vertical position, used only for ``Custom``.
+            text_type: ``Plain``, ``Date``, ``Time`` or ``DateAndTime``.
+            plain_text: The text drawn when ``text_type`` is ``Plain``.
+            font_size: Font size in points; omitted when ``None``.
+            date_format: Device-specific date format string.
+            time_format: Device-specific time format string.
+        """
         self._require_media1("SetOSD")
         self.call(
             service="media",
             operation="SetOSD",
-            body_inner=envelopes.media_set_osd(**kwargs),
+            body_inner=envelopes.media_set_osd(
+                osd_token=osd_token,
+                video_source_configuration_token=video_source_configuration_token,
+                osd_type=osd_type,
+                position_type=position_type,
+                pos_x=pos_x,
+                pos_y=pos_y,
+                text_type=text_type,
+                plain_text=plain_text,
+                font_size=font_size,
+                date_format=date_format,
+                time_format=time_format,
+            ),
         )
 
     def delete_osd(self, *, osd_token: str) -> None:
@@ -2836,13 +3140,333 @@ class OnvifClient:
             ),
         )
 
+    def get_profile(self, *, profile_token: str) -> dict[str, Any]:
+        """Return a single media profile by token (legacy Media service).
+
+        Media2 has no single-profile operation, so this requires the Media1 service.
+        """
+        self._require_media1("GetProfile")
+        xml = self.call(
+            service="media",
+            operation="GetProfile",
+            body_inner=envelopes.media_get_profile(profile_token=profile_token),
+        )
+        profiles = parsers.parse_profiles(xml)
+        return profiles[0] if profiles else {}
+
+    def get_video_source_configurations(self) -> list[dict[str, Any]]:
+        """Return the device's video source configurations (crop bounds, rotation, source).
+
+        These carry the ``configuration_token`` that :meth:`add_video_source_configuration`
+        needs — without this operation there is no way to discover one.
+        """
+        service, use_media2 = self._media_service()
+        xml = self.call(
+            service=service,
+            operation="GetVideoSourceConfigurations",
+            body_inner=envelopes.media_get_video_source_configurations(use_media2=use_media2),
+        )
+        return parsers.parse_video_source_configurations(xml)
+
+    def get_video_source_configuration_options(
+        self, *, configuration_token: str = "", profile_token: str = ""
+    ) -> dict[str, Any]:
+        """Return the bounds ranges, source tokens and rotation modes a video source accepts."""
+        service, use_media2 = self._media_service()
+        xml = self.call(
+            service=service,
+            operation="GetVideoSourceConfigurationOptions",
+            body_inner=envelopes.media_get_video_source_configuration_options(
+                use_media2=use_media2,
+                configuration_token=configuration_token,
+                profile_token=profile_token,
+            ),
+        )
+        return parsers.parse_video_source_configuration_options(xml)
+
+    def set_video_source_configuration(
+        self,
+        *,
+        token: str,
+        name: str,
+        source_token: str,
+        x: int = 0,
+        y: int = 0,
+        width: int = 0,
+        height: int = 0,
+        use_count: int | None = None,
+        rotate: str = "",
+        force_persistence: bool = True,
+    ) -> None:
+        """Set a video source configuration's crop bounds and optional rotation mode."""
+        service, use_media2 = self._media_service()
+        self.call(
+            service=service,
+            operation="SetVideoSourceConfiguration",
+            body_inner=envelopes.media_set_video_source_configuration(
+                token=token,
+                name=name,
+                source_token=source_token,
+                x=x,
+                y=y,
+                width=width,
+                height=height,
+                use_media2=use_media2,
+                use_count=use_count,
+                rotate=rotate,
+                force_persistence=force_persistence,
+            ),
+        )
+
+    def get_compatible_video_encoder_configurations(
+        self, *, profile_token: str
+    ) -> list[dict[str, Any]]:
+        """Return the encoder configurations that may legally be added to a profile."""
+        self._require_media1("GetCompatibleVideoEncoderConfigurations")
+        xml = self.call(
+            service="media",
+            operation="GetCompatibleVideoEncoderConfigurations",
+            body_inner=envelopes.media_get_compatible_video_encoder_configurations(
+                profile_token=profile_token
+            ),
+        )
+        return parsers.parse_video_encoder_configurations(xml)
+
+    def get_audio_encoder_configuration_options(
+        self, *, configuration_token: str = "", profile_token: str = ""
+    ) -> list[dict[str, Any]]:
+        """Return the encodings, bitrates and sample rates the audio encoder accepts."""
+        service, use_media2 = self._media_service()
+        xml = self.call(
+            service=service,
+            operation="GetAudioEncoderConfigurationOptions",
+            body_inner=envelopes.media_get_audio_encoder_configuration_options(
+                use_media2=use_media2,
+                configuration_token=configuration_token,
+                profile_token=profile_token,
+            ),
+        )
+        return parsers.parse_audio_encoder_configuration_options(xml)
+
+    def get_guaranteed_number_of_video_encoder_instances(
+        self, *, configuration_token: str
+    ) -> dict[str, int | None]:
+        """Return how many simultaneous encoder instances a video source can guarantee."""
+        self._require_media1("GetGuaranteedNumberOfVideoEncoderInstances")
+        xml = self.call(
+            service="media",
+            operation="GetGuaranteedNumberOfVideoEncoderInstances",
+            body_inner=envelopes.media_get_guaranteed_number_of_video_encoder_instances(
+                configuration_token=configuration_token
+            ),
+        )
+        return parsers.parse_encoder_instances(xml)
+
+    def media2_get_masks(self, *, configuration_token: str = "") -> list[dict[str, Any]]:
+        """Return the Media2 privacy masks, optionally scoped to one configuration."""
+        xml = self.call(
+            service="media2",
+            operation="GetMasks",
+            body_inner=envelopes.media2_get_masks(configuration_token=configuration_token),
+        )
+        return parsers.parse_masks(xml)
+
+    def media2_delete_mask(self, *, token: str) -> None:
+        """Delete a Media2 privacy mask by token."""
+        self.call(
+            service="media2",
+            operation="DeleteMask",
+            body_inner=envelopes.media2_delete_mask(token=token),
+        )
+
+    def get_endpoint_reference(self) -> str:
+        """Return the device's WS-Discovery endpoint reference GUID."""
+        xml = self.call(
+            service="device",
+            operation="GetEndpointReference",
+            body_inner=envelopes.device_get_endpoint_reference(),
+        )
+        return parsers.parse_text_element(xml, "GUID")
+
+    def get_storage_configurations(self) -> list[dict[str, Any]]:
+        """Return the device's configured storage targets (NFS/CIFS/local paths)."""
+        xml = self.call(
+            service="device",
+            operation="GetStorageConfigurations",
+            body_inner=envelopes.device_get_storage_configurations(),
+        )
+        return parsers.parse_storage_configurations(xml)
+
+    def imaging_get_move_options(self, *, video_source_token: str) -> dict[str, Any]:
+        """Return the focus move modes and ranges the imaging service supports."""
+        xml = self.call(
+            service="imaging",
+            operation="GetMoveOptions",
+            body_inner=envelopes.imaging_get_move_options(video_source_token=video_source_token),
+        )
+        return parsers.parse_named_element(xml, "MoveOptions")
+
+    def get_recording_options(self, *, recording_token: str) -> dict[str, Any]:
+        """Return the track and job capacity a recording still has available (Profile G)."""
+        xml = self.call(
+            service="recording",
+            operation="GetRecordingOptions",
+            body_inner=envelopes.recording_get_recording_options(recording_token=recording_token),
+        )
+        return parsers.parse_named_element(xml, "Options")
+
+    def start_firmware_upgrade(self) -> dict[str, str]:
+        """Begin a firmware upgrade and return where to upload the image.
+
+        The device replies with ``upload_uri``, ``upload_delay`` and ``expected_down_time``;
+        POST the firmware image to ``upload_uri`` yourself after waiting ``upload_delay``.
+        This reboots the device — there is no undo.
+        """
+        xml = self.call(
+            service="device",
+            operation="StartFirmwareUpgrade",
+            body_inner=envelopes.device_start_firmware_upgrade(),
+        )
+        return parsers.parse_upload_target(xml)
+
+    def start_system_restore(self) -> dict[str, str]:
+        """Begin a system restore and return where to upload the backup file.
+
+        Same shape as :meth:`start_firmware_upgrade`: POST the backup to ``upload_uri``.
+        This overwrites the device's configuration.
+        """
+        xml = self.call(
+            service="device",
+            operation="StartSystemRestore",
+            body_inner=envelopes.device_start_system_restore(),
+        )
+        return parsers.parse_upload_target(xml)
+
+
+class PullPointSubscription:
+    """A pull-point subscription that keeps itself alive and tidies up on exit.
+
+    Devices expire a pull-point at its ``TerminationTime`` unless renewed, and each vendor
+    reports expiry differently. This wrapper renews at half the termination interval,
+    re-creates the subscription when the device has forgotten it, and unsubscribes when the
+    ``with`` block ends. Build one with :meth:`OnvifClient.pull_point` rather than directly.
+    """
+
+    def __init__(
+        self,
+        client: OnvifClient,
+        *,
+        termination_time: str = "PT60S",
+        topic_filter: str = "",
+        timeout: str = "PT5S",
+        message_limit: int = 20,
+        auto_renew: bool = True,
+    ) -> None:
+        self._client = client
+        self._termination_time = termination_time
+        self._topic_filter = topic_filter
+        self._timeout = timeout
+        self._message_limit = message_limit
+        self._auto_renew = auto_renew
+        self._renew_interval_s = max(1.0, _iso8601_seconds(termination_time, 60.0) / 2)
+        self._renew_at = 0.0
+        self.subscription_url = ""
+
+    @property
+    def active(self) -> bool:
+        """Whether a subscription reference is currently held."""
+        return bool(self.subscription_url)
+
+    def create(self) -> str:
+        """Create (or re-create) the subscription and return its reference URL."""
+        result = self._client.events_create_pull_point(
+            termination_time=self._termination_time, topic_filter=self._topic_filter
+        )
+        url = str(result.get("subscription_url") or "")
+        if not url:
+            raise OnvifFaultError("Device returned a pull-point subscription with no reference.")
+        self.subscription_url = url
+        self._renew_at = time.monotonic() + self._renew_interval_s
+        return url
+
+    def renew(self) -> None:
+        """Extend the subscription's termination time."""
+        if not self.subscription_url:
+            return
+        self._client.events_renew(
+            subscription_url=self.subscription_url, termination_time=self._termination_time
+        )
+        self._renew_at = time.monotonic() + self._renew_interval_s
+
+    def unsubscribe(self) -> None:
+        """Cancel the subscription, ignoring a device that has already forgotten it."""
+        url, self.subscription_url = self.subscription_url, ""
+        if not url:
+            return
+        try:
+            self._client.events_unsubscribe(subscription_url=url)
+        except OnvifError as exc:
+            logger.debug("onveef: unsubscribe from %s failed (ignored): %s", url, exc)
+
+    def set_synchronization_point(self) -> None:
+        """Ask the device to re-send the current state of every property it reports."""
+        if self.subscription_url:
+            self._client.events_set_synchronization_point(subscription_url=self.subscription_url)
+
+    def pull(self) -> list[dict[str, Any]]:
+        """Long-poll once and return the notifications received (possibly an empty list)."""
+        if not self.subscription_url:
+            self.create()
+        if self._auto_renew and time.monotonic() >= self._renew_at:
+            try:
+                self.renew()
+            except OnvifError as exc:
+                logger.debug("onveef: pull-point renew failed, will re-create: %s", exc)
+                self.subscription_url = ""
+                self.create()
+        try:
+            result = self._client.events_pull_messages(
+                subscription_url=self.subscription_url,
+                timeout=self._timeout,
+                message_limit=self._message_limit,
+            )
+        except (OnvifFaultError, OnvifOperationNotSupportedError) as exc:
+            logger.debug("onveef: pull-point rejected the pull, re-creating: %s", exc)
+            self.subscription_url = ""
+            self.create()
+            result = self._client.events_pull_messages(
+                subscription_url=self.subscription_url,
+                timeout=self._timeout,
+                message_limit=self._message_limit,
+            )
+        messages = result.get("messages")
+        return messages if isinstance(messages, list) else []
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        """Yield notifications forever, blocking in the device's long poll between batches."""
+        while True:
+            yield from self.pull()
+
+    def __enter__(self) -> PullPointSubscription:
+        if not self.subscription_url:
+            self.create()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.unsubscribe()
+
 
 def _snapshot_get(
     *,
     snapshot_uri: str,
     auth: httpx.Auth | None,
     timeout_s: float,
-    verify_tls: bool,
+    verify_tls: bool | str | ssl.SSLContext,
 ) -> tuple[int, bytes, str]:
     try:
         with (
@@ -2876,7 +3500,7 @@ def fetch_snapshot_bytes(
     snapshot_uri: str,
     credentials: OnvifCredentials,
     timeout_s: float = 8.0,
-    verify_tls: bool = True,
+    verify_tls: bool | str | ssl.SSLContext = True,
 ) -> tuple[bytes, str]:
     """Fetch a JPEG snapshot from a snapshot URI using HTTP Digest (then Basic) auth.
 

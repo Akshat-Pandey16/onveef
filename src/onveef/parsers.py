@@ -448,12 +448,15 @@ def parse_profiles(xml: str) -> list[dict[str, Any]]:
     (``video_source``, ``video_encoder``, ``audio_encoder``, ``ptz``, ``metadata``).
     Both the Media1 element names (e.g. ``VideoEncoderConfiguration``) and the Media2
     names nested under ``<Configurations>`` (e.g. ``VideoEncoder``) are recognised.
+    Single-profile ``GetProfile`` responses, whose element is ``Profile`` rather than
+    ``Profiles``, are parsed the same way and returned as a one-item list.
     """
     root = parse_xml(xml)
     if root is None:
         return []
     profiles: list[dict[str, Any]] = []
-    for profile in find_all_local(root, "Profiles"):
+    elements = find_all_local(root, "Profiles") or find_all_local(root, "Profile")
+    for profile in elements:
         out: dict[str, Any] = {"token": _token(profile), "name": child_text(profile, "Name")}
 
         video_src = _find_cfg(profile, "VideoSourceConfiguration", "VideoSource")
@@ -1477,6 +1480,10 @@ def parse_event_properties(xml: str) -> dict[str, Any]:
 
     Walks the ``TopicSet`` tree and returns ``{"topics": [...]}``, a sorted list of
     fully-qualified topic path strings (e.g. ``tns1:VideoSource/MotionAlarm``).
+
+    A node counts as a topic if it carries a ``MessageDescription``/``Message`` child *or*
+    the WS-Topics ``topic="true"`` attribute. Devices that omit ``MessageDescription`` —
+    common on trimmed firmware — still have their topics discovered.
     """
     root = parse_xml(xml)
     if root is None:
@@ -1485,6 +1492,12 @@ def parse_event_properties(xml: str) -> dict[str, Any]:
     if topic_set is None:
         return {"topics": []}
     topics: list[str] = []
+
+    def _is_topic_node(el: ET.Element) -> bool:
+        return any(
+            _local(key) == "topic" and value.strip().lower() == "true"
+            for key, value in el.attrib.items()
+        )
 
     def walk(el: ET.Element, prefix: str) -> None:
         for child in el:
@@ -1499,6 +1512,8 @@ def parse_event_properties(xml: str) -> dict[str, Any]:
                 ns_prefix = _NS_PREFIX.get(_namespace(child.tag), "")
                 segment = f"{ns_prefix}:{local}" if ns_prefix else local
             path = f"{prefix}/{segment}" if prefix else segment
+            if _is_topic_node(child):
+                topics.append(path)
             walk(child, path)
 
     walk(topic_set, "")
@@ -2174,4 +2189,202 @@ def parse_system_uris(xml: str) -> dict[str, Any]:
             logs.append({"type": child_text(lu, "Type"), "uri": uri})
     if logs:
         out["system_log_uris"] = logs
+    return out
+
+
+def parse_video_source_configurations(xml: str) -> list[dict[str, Any]]:
+    """Parse a ``GetVideoSourceConfigurations`` (or ``...Configuration``) response.
+
+    Returns a list of dicts, each with ``token``, ``name``, ``use_count``, ``source_token``
+    and a ``bounds`` dict of ``x``/``y``/``width``/``height``, plus ``rotate`` when the
+    device reports a rotation extension.
+    """
+    root = parse_xml(xml)
+    if root is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for cfg in find_all_local(root, "Configurations") + find_all_local(root, "Configuration"):
+        info: dict[str, Any] = {
+            "token": cfg.attrib.get("token", ""),
+            "name": child_text(cfg, "Name"),
+            "use_count": _opt_int(child_text(cfg, "UseCount")),
+            "source_token": child_text(cfg, "SourceToken"),
+        }
+        bounds = child_local(cfg, "Bounds")
+        if bounds is not None:
+            info["bounds"] = {
+                key: _opt_int(bounds.attrib.get(key, "")) for key in ("x", "y", "width", "height")
+            }
+        rotate = find_local(cfg, "Rotate")
+        if rotate is not None:
+            info["rotate"] = child_text(rotate, "Mode")
+            degree = child_text(rotate, "Degree")
+            if degree:
+                info["rotate_degree"] = _opt_int(degree)
+        out.append(info)
+    return out
+
+
+def parse_video_source_configuration_options(xml: str) -> dict[str, Any]:
+    """Parse a ``GetVideoSourceConfigurationOptions`` response.
+
+    Returns a dict with ``bounds_range`` (the ``x``/``y``/``width``/``height`` ranges the
+    device accepts), ``video_source_tokens`` and ``rotate_modes``. The full option tree is
+    preserved verbatim under ``raw`` because vendors extend it heavily.
+    """
+    root = parse_xml(xml)
+    if root is None:
+        return {}
+    options = find_local(root, "Options")
+    if options is None:
+        return {}
+    result: dict[str, Any] = {
+        "video_source_tokens": _direct_texts(options, "VideoSourceTokensAvailable"),
+        "rotate_modes": [],
+    }
+    bounds = child_local(options, "BoundsRange")
+    if bounds is not None:
+        ranges: dict[str, dict[str, int | None]] = {}
+        for key in ("XRange", "YRange", "WidthRange", "HeightRange"):
+            el = child_local(bounds, key)
+            if el is not None:
+                ranges[key[:-5].lower()] = {
+                    "min": _opt_int(child_text(el, "Min")),
+                    "max": _opt_int(child_text(el, "Max")),
+                }
+        result["bounds_range"] = ranges
+    rotate = find_local(options, "Rotate")
+    if rotate is not None:
+        result["rotate_modes"] = _direct_texts(rotate, "Mode")
+    raw = _element_to_dict(options)
+    result["raw"] = raw if isinstance(raw, dict) else {}
+    return result
+
+
+def parse_audio_encoder_configuration_options(xml: str) -> list[dict[str, Any]]:
+    """Parse a ``GetAudioEncoderConfigurationOptions`` response.
+
+    Returns one dict per advertised option with ``encoding`` plus ``bitrate_list`` and
+    ``sample_rate_list`` (both lists of ints).
+    """
+    root = parse_xml(xml)
+    if root is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for option in find_all_local(root, "Options"):
+        bitrates = child_local(option, "BitrateList")
+        rates = child_local(option, "SampleRateList")
+        out.append(
+            {
+                "encoding": child_text(option, "Encoding"),
+                "bitrate_list": [
+                    v for v in (_opt_int(t) for t in _direct_texts(bitrates, "Items")) if v
+                ]
+                if bitrates is not None
+                else [],
+                "sample_rate_list": [
+                    v for v in (_opt_int(t) for t in _direct_texts(rates, "Items")) if v
+                ]
+                if rates is not None
+                else [],
+            }
+        )
+    return out
+
+
+def parse_encoder_instances(xml: str) -> dict[str, int | None]:
+    """Parse a ``GetGuaranteedNumberOfVideoEncoderInstances`` response.
+
+    Returns ``total`` plus the optional per-codec guarantees (``jpeg``, ``h264``, ``mpeg4``).
+    """
+    root = parse_xml(xml)
+    if root is None:
+        return {}
+    return {
+        "total": _opt_int(_text_of(find_local(root, "TotalNumber"))),
+        "jpeg": _opt_int(_text_of(find_local(root, "JPEG"))),
+        "h264": _opt_int(_text_of(find_local(root, "H264"))),
+        "mpeg4": _opt_int(_text_of(find_local(root, "MPEG4"))),
+    }
+
+
+def parse_upload_target(xml: str) -> dict[str, str]:
+    """Parse a ``StartFirmwareUpgrade`` / ``StartSystemRestore`` response.
+
+    Returns ``upload_uri`` (where to POST the image), ``upload_delay`` and
+    ``expected_down_time`` as raw ISO-8601 durations.
+    """
+    root = parse_xml(xml)
+    if root is None:
+        return {}
+    return {
+        "upload_uri": _text_of(find_local(root, "UploadUri")),
+        "upload_delay": _text_of(find_local(root, "UploadDelay")),
+        "expected_down_time": _text_of(find_local(root, "ExpectedDownTime")),
+    }
+
+
+def parse_masks(xml: str) -> list[dict[str, Any]]:
+    """Parse a Media2 ``GetMasks`` response.
+
+    Returns a list of dicts with ``token``, ``configuration_token``, ``type``, ``enabled``,
+    ``color`` (the device's colour attributes) and ``polygon`` (a list of ``x``/``y`` floats).
+    """
+    root = parse_xml(xml)
+    if root is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for mask in find_all_local(root, "Masks"):
+        info: dict[str, Any] = {
+            "token": mask.attrib.get("token", ""),
+            "configuration_token": child_text(mask, "ConfigurationToken"),
+            "type": child_text(mask, "Type"),
+            "enabled": _to_bool(child_text(mask, "Enabled")),
+        }
+        polygon = child_local(mask, "Polygon")
+        if polygon is not None:
+            info["polygon"] = [
+                {
+                    "x": _opt_float(point.attrib.get("x", "")),
+                    "y": _opt_float(point.attrib.get("y", "")),
+                }
+                for point in find_all_local(polygon, "Point")
+            ]
+        color = child_local(mask, "Color")
+        if color is not None:
+            info["color"] = dict(color.attrib)
+        out.append(info)
+    return out
+
+
+def parse_storage_configurations(xml: str) -> list[dict[str, Any]]:
+    """Parse a ``GetStorageConfigurations`` response.
+
+    Returns a list of dicts with ``token``, ``type``, ``local_path``, ``storage_uri`` and a
+    ``user`` dict when credentials are advertised.
+    """
+    root = parse_xml(xml)
+    if root is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for cfg in find_all_local(root, "StorageConfigurations"):
+        data = child_local(cfg, "Data")
+        source = child_local(data, "Data") if data is not None else None
+        block = source if source is not None else data
+        info: dict[str, Any] = {"token": cfg.attrib.get("token", "")}
+        if block is not None:
+            info.update(
+                {
+                    "type": child_text(block, "Type"),
+                    "local_path": child_text(block, "LocalPath"),
+                    "storage_uri": child_text(block, "StorageUri"),
+                }
+            )
+            user = child_local(block, "User")
+            if user is not None:
+                info["user"] = {
+                    "username": child_text(user, "UserName"),
+                    "password": child_text(user, "Password"),
+                }
+        out.append(info)
     return out

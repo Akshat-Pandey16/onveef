@@ -20,7 +20,13 @@ def _client() -> OnvifClient:
 def _stub(client: OnvifClient, xml: str) -> list[str]:
     captured: list[str] = []
 
-    def fake_post_soap(*, url: str, envelope: str, content_type: str) -> tuple[int, str]:
+    def fake_post_soap(
+        *,
+        url: str,
+        envelope: str,
+        content_type: str,
+        read_timeout_s: float | None = None,
+    ) -> tuple[int, str]:
         captured.append(envelope)
         return 200, xml
 
@@ -93,3 +99,28 @@ def test_client_imaging_and_ptz_dispatch() -> None:
     sent = _stub(client, "<SetGeoLocationResponse/>")
     client.set_geo_location(lon=1.0, lat=2.0)
     assert "<tds:SetGeoLocation>" in sent[0]
+
+
+def test_breaker_configure_affects_new_instances() -> None:
+    """Module-level configure() used to be a no-op for instances created afterwards."""
+    from onveef import breaker as breaker_module
+
+    original = (breaker_module._WINDOW_S, breaker_module._THRESHOLD, breaker_module._OPEN_S)
+    try:
+        breaker_module.configure(window_s=11.0, threshold=7, open_s=13.0)
+        fresh = breaker_module.CircuitBreaker()
+        assert (fresh.window_s, fresh.threshold, fresh.open_s) == (11.0, 7, 13.0)
+        explicit = breaker_module.CircuitBreaker(threshold=2)
+        assert explicit.threshold == 2
+        assert explicit.window_s == 11.0
+    finally:
+        breaker_module.configure(window_s=original[0], threshold=original[1], open_s=original[2])
+        breaker_module.reset()
+
+
+def test_default_user_agent_tracks_the_package_version() -> None:
+    """A hardcoded string drifts from __version__ on every release."""
+    import onveef
+    from onveef.client import DEFAULT_USER_AGENT
+
+    assert f"onveef/{onveef.__version__}" == DEFAULT_USER_AGENT

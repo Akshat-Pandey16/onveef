@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import ssl
+import time
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from types import TracebackType
 from typing import Any
 
 import httpx
 
-from onveef import breaker, envelopes, pacs, parsers
+from onveef import breaker, envelopes, pacs, parsers, urls
 from onveef.client import (
     _CONTENT_TYPES,
     _DEFAULT_DEVICE_PATH,
@@ -70,18 +74,22 @@ class AsyncOnvifClient:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         connect_timeout_s: float | None = None,
         read_timeout_s: float | None = None,
-        verify_tls: bool = True,
+        verify_tls: bool | str | ssl.SSLContext = True,
+        rewrite_host: bool = True,
         breaker_key: str | None = None,
         breaker_window_s: float = 60.0,
         breaker_threshold: int = 3,
         breaker_open_s: float = 30.0,
         password_text: bool = False,
-        password_text_fallback: bool = True,
+        password_text_fallback: bool = False,
         ws_timestamp: bool = False,
         http_auth: str = "auto",
         retries: int = 2,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         user_agent: str = DEFAULT_USER_AGENT,
+        transport: httpx.AsyncBaseTransport | None = None,
+        proxy: str | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         if endpoint is None:
             if not host:
@@ -121,28 +129,55 @@ class AsyncOnvifClient:
         self._password_text_fallback = password_text_fallback
         self._ws_timestamp = ws_timestamp
         self._auto_discover = auto_discover
+        self._rewrite_host = rewrite_host
         self._discovered = False
         self._clock_offset_s = 0.0
         self._clock_synced = False
         self._clock_syncing = False
         self._clock_lock = asyncio.Lock()
-        self._read_override_s: float | None = None
-        self._client = httpx.AsyncClient(
+        self._discover_lock = asyncio.Lock()
+        self._owns_client = http_client is None
+        self._client = http_client or httpx.AsyncClient(
             timeout=self._timeout,
             verify=verify_tls,
             headers={"User-Agent": user_agent},
             follow_redirects=False,
+            transport=transport,
+            proxy=proxy,
         )
 
     async def __aenter__(self) -> AsyncOnvifClient:
         return self
 
-    async def __aexit__(self, *_exc: object) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Close the underlying async HTTP connection pool."""
-        await self._client.aclose()
+        """Close the underlying async pool, unless the client was supplied by the caller."""
+        if self._owns_client:
+            await self._client.aclose()
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(device_xaddr={self._endpoint.device_xaddr!r}, "
+            f"username={self._credentials.username!r}, "
+            f"services={sorted(self._endpoint.services)})"
+        )
+
+    def local_address(self) -> str:
+        """Return the host this client connects to, used as the host-rewrite reference."""
+        return urls.host_of(self._endpoint.device_xaddr)
+
+    def _fix_url(self, url: str) -> str:
+        """Re-point a device-reported URL at the address we reached the device on."""
+        if not self._rewrite_host:
+            return url
+        return urls.rewrite_host(url, self._endpoint.device_xaddr)
 
     @property
     def endpoint(self) -> OnvifEndpoint:
@@ -166,14 +201,18 @@ class AsyncOnvifClient:
     async def _discover_once(self) -> None:
         if self._discovered:
             return
-        self._discovered = True
-        try:
-            services = await self.discover_services()
-        except OnvifError:
-            return
-        if services:
-            merged = {**services, **{k: v for k, v in self._endpoint.services.items() if v}}
-            self._endpoint = OnvifEndpoint(self._endpoint.device_xaddr, services=merged)
+        async with self._discover_lock:
+            if self._discovered:
+                return
+            try:
+                services = await self.discover_services()
+            except OnvifError:
+                services = {}
+            finally:
+                self._discovered = True
+            if services:
+                merged = {**services, **{k: v for k, v in self._endpoint.services.items() if v}}
+                self._endpoint = OnvifEndpoint(self._endpoint.device_xaddr, services=merged)
 
     async def _has(self, service: str) -> bool:
         """Whether the device advertises ``service``, running auto-discovery first if needed."""
@@ -250,12 +289,18 @@ class AsyncOnvifClient:
         return None
 
     async def _raw_post(
-        self, *, url: str, content_type: str, envelope: str, auth: httpx.Auth | None
+        self,
+        *,
+        url: str,
+        content_type: str,
+        envelope: str,
+        auth: httpx.Auth | None,
+        read_timeout_s: float | None,
     ) -> tuple[int, str, str]:
         timeout = (
             self._timeout
-            if self._read_override_s is None
-            else httpx.Timeout(self._timeout, read=self._read_override_s)
+            if read_timeout_s is None
+            else httpx.Timeout(self._timeout, read=read_timeout_s)
         )
         async with self._client.stream(
             "POST",
@@ -279,15 +324,30 @@ class AsyncOnvifClient:
                 text = bytes(body).decode("utf-8", errors="replace")
             return response.status_code, text, response.headers.get("WWW-Authenticate", "")
 
-    async def _post_soap(self, *, url: str, envelope: str, content_type: str) -> tuple[int, str]:
+    async def _post_soap(
+        self,
+        *,
+        url: str,
+        envelope: str,
+        content_type: str,
+        read_timeout_s: float | None = None,
+    ) -> tuple[int, str]:
         status, text, challenge = await self._raw_post(
-            url=url, content_type=content_type, envelope=envelope, auth=None
+            url=url,
+            content_type=content_type,
+            envelope=envelope,
+            auth=None,
+            read_timeout_s=read_timeout_s,
         )
         if status == 401:
             auth = self._http_auth_for(challenge)
             if auth is not None:
                 status, text, _ = await self._raw_post(
-                    url=url, content_type=content_type, envelope=envelope, auth=auth
+                    url=url,
+                    content_type=content_type,
+                    envelope=envelope,
+                    auth=auth,
+                    read_timeout_s=read_timeout_s,
                 )
         return status, text
 
@@ -295,14 +355,21 @@ class AsyncOnvifClient:
         jitter = 0.5 + random.random()
         return float(min(2.0, 0.25 * (2**attempt)) * jitter)
 
-    async def _send_cycle(self, *, xaddr: str, operation: str, envelope: str) -> str:
+    async def _send_cycle(
+        self, *, xaddr: str, operation: str, envelope: str, read_timeout_s: float | None = None
+    ) -> str:
         last_status = 0
         last_text = ""
         for ct in _CONTENT_TYPES:
             try:
-                status, text = await self._post_soap(url=xaddr, envelope=envelope, content_type=ct)
+                status, text = await self._post_soap(
+                    url=xaddr,
+                    envelope=envelope,
+                    content_type=ct,
+                    read_timeout_s=read_timeout_s,
+                )
             except httpx.TimeoutException as exc:
-                if self._read_override_s is None:
+                if read_timeout_s is None:
                     self._record_failure()
                 raise OnvifTimeoutError(f"ONVIF call '{operation}' timed out: {exc}") from exc
             except httpx.HTTPError as exc:
@@ -358,6 +425,7 @@ class AsyncOnvifClient:
         body_inner: str,
         with_auth: bool,
         password_text: bool | None = None,
+        read_timeout_s: float | None = None,
     ) -> str:
         if self._breaker_open():
             raise OnvifTransportError(
@@ -365,7 +433,7 @@ class AsyncOnvifClient:
                 "(recent transport failures)."
             )
         text_mode = self._password_text if password_text is None else password_text
-        long_poll = self._read_override_s is not None
+        long_poll = read_timeout_s is not None
         max_attempts = 1 if long_poll or not _is_idempotent(operation) else self._retries + 1
         transient: OnvifError | None = None
         for attempt in range(max_attempts):
@@ -378,7 +446,12 @@ class AsyncOnvifClient:
                 add_timestamp=self._ws_timestamp if with_auth else False,
             )
             try:
-                return await self._send_cycle(xaddr=xaddr, operation=operation, envelope=envelope)
+                return await self._send_cycle(
+                    xaddr=xaddr,
+                    operation=operation,
+                    envelope=envelope,
+                    read_timeout_s=read_timeout_s,
+                )
             except (OnvifTimeoutError, OnvifServiceUnavailableError) as exc:
                 transient = exc
             except OnvifTransportError as exc:
@@ -403,11 +476,14 @@ class AsyncOnvifClient:
         operation: str,
         body_inner: str,
         require_auth: bool | None = None,
+        read_timeout_s: float | None = None,
     ) -> str:
         """Send one SOAP operation and return the raw response XML (advanced/escape hatch).
 
         Handles auth (WS-Security digest, clock-skew resync, optional plaintext fallback),
         content-type negotiation, retries, the circuit breaker, and fault classification.
+        ``read_timeout_s`` overrides the read timeout for this one request without leaking
+        into other requests that share this client.
         """
         await self._ensure(service)
         xaddr = self.require(service)
@@ -421,14 +497,22 @@ class AsyncOnvifClient:
         if not wants_auth:
             try:
                 return await self._call_raw(
-                    xaddr=xaddr, operation=operation, body_inner=body_inner, with_auth=False
+                    xaddr=xaddr,
+                    operation=operation,
+                    body_inner=body_inner,
+                    with_auth=False,
+                    read_timeout_s=read_timeout_s,
                 )
             except OnvifAuthError:
                 if not self._credentials.configured:
                     raise
         try:
             return await self._call_raw(
-                xaddr=xaddr, operation=operation, body_inner=body_inner, with_auth=True
+                xaddr=xaddr,
+                operation=operation,
+                body_inner=body_inner,
+                with_auth=True,
+                read_timeout_s=read_timeout_s,
             )
         except OnvifAuthError:
             if not self._credentials.configured:
@@ -442,6 +526,7 @@ class AsyncOnvifClient:
                             operation=operation,
                             body_inner=body_inner,
                             with_auth=True,
+                            read_timeout_s=read_timeout_s,
                         )
                     except OnvifAuthError:
                         pass
@@ -461,6 +546,7 @@ class AsyncOnvifClient:
                     body_inner=body_inner,
                     with_auth=True,
                     password_text=True,
+                    read_timeout_s=read_timeout_s,
                 )
             raise
 
@@ -500,16 +586,26 @@ class AsyncOnvifClient:
             self._clock_offset_s = (device_utc - datetime.now(UTC)).total_seconds()
             self._clock_synced = True
 
-    async def _post_xml(self, *, url: str, envelope: str, operation: str) -> str:
+    async def _post_xml(
+        self, *, url: str, envelope: str, operation: str, read_timeout_s: float | None = None
+    ) -> str:
         if self._breaker_open():
             raise OnvifTransportError(
                 f"ONVIF call '{operation}' skipped: device circuit breaker open "
                 "(recent transport failures)."
             )
-        return await self._send_cycle(xaddr=url, operation=operation, envelope=envelope)
+        return await self._send_cycle(
+            xaddr=url, operation=operation, envelope=envelope, read_timeout_s=read_timeout_s
+        )
 
     async def _post_subscription(
-        self, *, subscription_url: str, body: str, wsa_action: str, operation: str
+        self,
+        *,
+        subscription_url: str,
+        body: str,
+        wsa_action: str,
+        operation: str,
+        read_timeout_s: float | None = None,
     ) -> str:
         def build() -> str:
             return envelopes.build_envelope(
@@ -524,14 +620,24 @@ class AsyncOnvifClient:
             )
 
         try:
-            return await self._post_xml(url=subscription_url, envelope=build(), operation=operation)
+            return await self._post_xml(
+                url=subscription_url,
+                envelope=build(),
+                operation=operation,
+                read_timeout_s=read_timeout_s,
+            )
         except OnvifAuthError:
             if self._clock_synced or not self._credentials.configured:
                 raise
             await self._sync_clock_offset()
             if self._clock_offset_s == 0.0:
                 raise
-            return await self._post_xml(url=subscription_url, envelope=build(), operation=operation)
+            return await self._post_xml(
+                url=subscription_url,
+                envelope=build(),
+                operation=operation,
+                read_timeout_s=read_timeout_s,
+            )
 
     async def get_device_information(self) -> dict[str, str]:
         """Return the device's manufacturer/model/firmware/serial/hardware information."""
@@ -561,14 +667,21 @@ class AsyncOnvifClient:
         return parsers.parse_services(xml)
 
     async def discover_services(self) -> dict[str, str]:
-        """Discover per-service XAddrs, preferring ``GetServices`` and falling back to caps."""
+        """Discover per-service XAddrs, preferring ``GetServices`` and falling back to caps.
+
+        Unless ``rewrite_host=False`` was passed, every XAddr is re-pointed at the address
+        this client reached the device on, so devices that advertise their own unreachable
+        address (NAT, port forward, Docker bridge, stale DHCP lease) still work.
+        """
         try:
             services = await self.get_services()
-            if services:
-                return services
+            if not services:
+                services = await self.get_capabilities()
         except OnvifFaultError:
-            services = {}
-        return await self.get_capabilities()
+            services = await self.get_capabilities()
+        if not self._rewrite_host:
+            return services
+        return urls.rewrite_service_map(services, self._endpoint.device_xaddr)
 
     async def get_system_date_time(self) -> dict[str, Any]:
         """Return the device's system date/time (UTC and local)."""
@@ -1087,8 +1200,13 @@ class AsyncOnvifClient:
         stream: str = "RTP-Unicast",
         protocol: str = "RTSP",
         protocol2: str = "RtspUnicast",
+        with_credentials: bool = False,
     ) -> str:
-        """Return the RTSP stream URI for a profile."""
+        """Return the RTSP stream URI for a profile, host-rewritten to the connected address.
+
+        Pass ``with_credentials=True`` to embed percent-encoded credentials in the URI, which
+        is what ffmpeg, OpenCV, GStreamer and go2rtc expect.
+        """
         service, use_media2 = await self._media_service()
         xml = await self.call(
             service=service,
@@ -1101,10 +1219,15 @@ class AsyncOnvifClient:
                 protocol2=protocol2,
             ),
         )
-        return parsers.parse_stream_uri(xml)
+        uri = self._fix_url(parsers.parse_stream_uri(xml))
+        if with_credentials:
+            return urls.with_credentials(
+                uri, self._credentials.username, self._credentials.password
+            )
+        return uri
 
-    async def get_snapshot_uri(self, *, profile_token: str) -> str:
-        """Return the JPEG snapshot URI for a profile."""
+    async def get_snapshot_uri(self, *, profile_token: str, with_credentials: bool = False) -> str:
+        """Return the JPEG snapshot URI for a profile, host-rewritten like the stream URI."""
         service, use_media2 = await self._media_service()
         xml = await self.call(
             service=service,
@@ -1113,7 +1236,12 @@ class AsyncOnvifClient:
                 profile_token=profile_token, use_media2=use_media2
             ),
         )
-        return parsers.parse_snapshot_uri(xml)
+        uri = self._fix_url(parsers.parse_snapshot_uri(xml))
+        if with_credentials:
+            return urls.with_credentials(
+                uri, self._credentials.username, self._credentials.password
+            )
+        return uri
 
     async def get_snapshot(self, *, profile_token: str) -> tuple[bytes, str]:
         """Fetch a JPEG snapshot for a profile as ``(image_bytes, content_type)``.
@@ -1233,6 +1361,23 @@ class AsyncOnvifClient:
         raise OnvifCapabilityMissingError(
             "GetVideoEncoderConfigurationOptions requires a Media or Media2 service."
         )
+
+    async def get_video_encoder_options_normalized(
+        self, *, configuration_token: str = "", profile_token: str = "", prefer: str = "auto"
+    ) -> list[dict[str, Any]]:
+        """Return encoder options normalized into one shape across Media1 and Media2.
+
+        Media1 and Media2 describe the same capabilities with different element names and
+        attribute-vs-element layouts. This flattens both into a list of per-encoding dicts
+        (``encoding``, ``resolutions``, ``fps``, ``bitrate_kbps``, ``gop``, ``quality``,
+        ``profiles``), which is what you want when building an encoder-settings UI.
+        """
+        _service, xml = await self.get_video_encoder_options_raw(
+            configuration_token=configuration_token,
+            profile_token=profile_token,
+            prefer=prefer,
+        )
+        return parsers.parse_video_encoder_options_normalized(xml)
 
     async def set_video_encoder_configuration_media2(
         self,
@@ -1435,23 +1580,101 @@ class AsyncOnvifClient:
         )
         return parsers.parse_osd_options(xml)
 
-    async def create_osd(self, **kwargs: Any) -> str:
-        """Create an OSD entry and return its token (legacy Media service)."""
+    async def create_osd(
+        self,
+        *,
+        video_source_configuration_token: str,
+        osd_type: str = "Text",
+        position_type: str = "UpperLeft",
+        pos_x: float | None = None,
+        pos_y: float | None = None,
+        text_type: str = "Plain",
+        plain_text: str = "",
+        font_size: int | None = None,
+        date_format: str = "",
+        time_format: str = "",
+    ) -> str:
+        """Create an on-screen display overlay (legacy Media service).
+
+        Args:
+            video_source_configuration_token: The video source the OSD is drawn on.
+            osd_type: ``Text`` or ``Image``.
+            position_type: ``UpperLeft``, ``UpperRight``, ``LowerLeft``, ``LowerRight`` or
+                ``Custom`` — ``Custom`` uses ``pos_x``/``pos_y``.
+            pos_x: Normalised -1..1 horizontal position, used only for ``Custom``.
+            pos_y: Normalised -1..1 vertical position, used only for ``Custom``.
+            text_type: ``Plain``, ``Date``, ``Time`` or ``DateAndTime``.
+            plain_text: The text drawn when ``text_type`` is ``Plain``.
+            font_size: Font size in points; omitted when ``None``.
+            date_format: Device-specific date format string.
+            time_format: Device-specific time format string.
+        """
         await self._require_media1("CreateOSD")
         xml = await self.call(
             service="media",
             operation="CreateOSD",
-            body_inner=envelopes.media_create_osd(**kwargs),
+            body_inner=envelopes.media_create_osd(
+                video_source_configuration_token=video_source_configuration_token,
+                osd_type=osd_type,
+                position_type=position_type,
+                pos_x=pos_x,
+                pos_y=pos_y,
+                text_type=text_type,
+                plain_text=plain_text,
+                font_size=font_size,
+                date_format=date_format,
+                time_format=time_format,
+            ),
         )
         return parsers.parse_created_token(xml, tag="OSDToken")
 
-    async def set_osd(self, **kwargs: Any) -> None:
-        """Update an OSD entry (legacy Media service)."""
+    async def set_osd(
+        self,
+        *,
+        osd_token: str,
+        video_source_configuration_token: str,
+        osd_type: str = "Text",
+        position_type: str = "UpperLeft",
+        pos_x: float | None = None,
+        pos_y: float | None = None,
+        text_type: str = "Plain",
+        plain_text: str = "",
+        font_size: int | None = None,
+        date_format: str = "",
+        time_format: str = "",
+    ) -> None:
+        """Update an on-screen display overlay (legacy Media service).
+
+        Args:
+            osd_token: The OSD to update.\n            video_source_configuration_token: The video source the OSD is drawn on.
+            osd_type: ``Text`` or ``Image``.
+            position_type: ``UpperLeft``, ``UpperRight``, ``LowerLeft``, ``LowerRight`` or
+                ``Custom`` — ``Custom`` uses ``pos_x``/``pos_y``.
+            pos_x: Normalised -1..1 horizontal position, used only for ``Custom``.
+            pos_y: Normalised -1..1 vertical position, used only for ``Custom``.
+            text_type: ``Plain``, ``Date``, ``Time`` or ``DateAndTime``.
+            plain_text: The text drawn when ``text_type`` is ``Plain``.
+            font_size: Font size in points; omitted when ``None``.
+            date_format: Device-specific date format string.
+            time_format: Device-specific time format string.
+        """
         await self._require_media1("SetOSD")
         await self.call(
             service="media",
             operation="SetOSD",
-            body_inner=envelopes.media_set_osd(**kwargs),
+            body_inner=envelopes.media_set_osd(
+                osd_token=osd_token,
+                video_source_configuration_token=video_source_configuration_token,
+                osd_type=osd_type,
+                position_type=position_type,
+                pos_x=pos_x,
+                pos_y=pos_y,
+                text_type=text_type,
+                plain_text=plain_text,
+                font_size=font_size,
+                date_format=date_format,
+                time_format=time_format,
+            ),
         )
 
     async def delete_osd(self, *, osd_token: str) -> None:
@@ -2084,7 +2307,11 @@ class AsyncOnvifClient:
     async def events_create_pull_point(
         self, *, termination_time: str = "PT60S", topic_filter: str = ""
     ) -> dict[str, Any]:
-        """Create a pull-point subscription and return its manager URL/times."""
+        """Create a pull-point subscription and return its manager URL/times.
+
+        The ``subscription_url`` is host-rewritten like any other device-reported address.
+        Prefer :meth:`pull_point`, which keeps the subscription alive for you.
+        """
         xml = await self.call(
             service="events",
             operation="CreatePullPointSubscription",
@@ -2092,7 +2319,39 @@ class AsyncOnvifClient:
                 termination_time=termination_time, topic_filter=topic_filter
             ),
         )
-        return parsers.parse_create_pull_point(xml)
+        result = parsers.parse_create_pull_point(xml)
+        if result.get("subscription_url"):
+            result["subscription_url"] = self._fix_url(str(result["subscription_url"]))
+        return result
+
+    def pull_point(
+        self,
+        *,
+        termination_time: str = "PT60S",
+        topic_filter: str = "",
+        timeout: str = "PT5S",
+        message_limit: int = 20,
+        auto_renew: bool = True,
+    ) -> AsyncPullPointSubscription:
+        """Return a managed pull-point subscription that renews and cleans up after itself.
+
+        Use it as an async context manager; iteration blocks in the device's long poll::
+
+            async with cam.pull_point(topic_filter="tns1:RuleEngine//.") as sub:
+                async for message in sub:
+                    print(message["topic"], message["data"])
+
+        Unlike the sync helper this does not create the subscription eagerly — entering the
+        ``async with`` block does, since creation needs to await.
+        """
+        return AsyncPullPointSubscription(
+            self,
+            termination_time=termination_time,
+            topic_filter=topic_filter,
+            timeout=timeout,
+            message_limit=message_limit,
+            auto_renew=auto_renew,
+        )
 
     async def events_subscribe(
         self, *, consumer_address: str, topic_filter: str = "", termination_time: str = "PT60S"
@@ -2117,20 +2376,15 @@ class AsyncOnvifClient:
         message_limit: int = 20,
     ) -> dict[str, Any]:
         """Long-poll a pull-point subscription for notification messages."""
-        prev_override = self._read_override_s
-        self._read_override_s = _iso8601_seconds(timeout, 5.0) + 5.0
-        try:
-            xml = await self._post_subscription(
-                subscription_url=subscription_url,
-                body=envelopes.events_pull_messages(timeout=timeout, message_limit=message_limit),
-                wsa_action=(
-                    "http://www.onvif.org/ver10/events/wsdl/"
-                    "PullPointSubscription/PullMessagesRequest"
-                ),
-                operation="PullMessages",
-            )
-        finally:
-            self._read_override_s = prev_override
+        xml = await self._post_subscription(
+            subscription_url=subscription_url,
+            body=envelopes.events_pull_messages(timeout=timeout, message_limit=message_limit),
+            wsa_action=(
+                "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest"
+            ),
+            operation="PullMessages",
+            read_timeout_s=_iso8601_seconds(timeout, 5.0) + 5.0,
+        )
         return parsers.parse_pull_messages(xml)
 
     async def events_renew(self, *, subscription_url: str, termination_time: str = "PT60S") -> None:
@@ -2507,8 +2761,9 @@ class AsyncOnvifClient:
         recording_token: str,
         stream: str = "RTP-Unicast",
         protocol: str = "RTSP",
+        with_credentials: bool = False,
     ) -> str:
-        """Return the replay (RTSP) URI for a recording (Profile G)."""
+        """Return the replay (RTSP) URI for a recording (Profile G), host-rewritten."""
         xml = await self.call(
             service="replay",
             operation="GetReplayUri",
@@ -2516,7 +2771,12 @@ class AsyncOnvifClient:
                 recording_token=recording_token, stream=stream, protocol=protocol
             ),
         )
-        return parsers.parse_stream_uri(xml)
+        uri = self._fix_url(parsers.parse_stream_uri(xml))
+        if with_credentials:
+            return urls.with_credentials(
+                uri, self._credentials.username, self._credentials.password
+            )
+        return uri
 
     async def get_replay_configuration(self) -> dict[str, Any]:
         """Return the replay service configuration (Profile G)."""
@@ -2738,3 +2998,324 @@ class AsyncOnvifClient:
             operation="DeleteCredential",
             body_inner=pacs.delete_credential(token=token),
         )
+
+    async def get_profile(self, *, profile_token: str) -> dict[str, Any]:
+        """Return a single media profile by token (legacy Media service).
+
+        Media2 has no single-profile operation, so this requires the Media1 service.
+        """
+        await self._require_media1("GetProfile")
+        xml = await self.call(
+            service="media",
+            operation="GetProfile",
+            body_inner=envelopes.media_get_profile(profile_token=profile_token),
+        )
+        profiles = parsers.parse_profiles(xml)
+        return profiles[0] if profiles else {}
+
+    async def get_video_source_configurations(self) -> list[dict[str, Any]]:
+        """Return the device's video source configurations (crop bounds, rotation, source).
+
+        These carry the ``configuration_token`` that :meth:`add_video_source_configuration`
+        needs — without this operation there is no way to discover one.
+        """
+        service, use_media2 = await self._media_service()
+        xml = await self.call(
+            service=service,
+            operation="GetVideoSourceConfigurations",
+            body_inner=envelopes.media_get_video_source_configurations(use_media2=use_media2),
+        )
+        return parsers.parse_video_source_configurations(xml)
+
+    async def get_video_source_configuration_options(
+        self, *, configuration_token: str = "", profile_token: str = ""
+    ) -> dict[str, Any]:
+        """Return the bounds ranges, source tokens and rotation modes a video source accepts."""
+        service, use_media2 = await self._media_service()
+        xml = await self.call(
+            service=service,
+            operation="GetVideoSourceConfigurationOptions",
+            body_inner=envelopes.media_get_video_source_configuration_options(
+                use_media2=use_media2,
+                configuration_token=configuration_token,
+                profile_token=profile_token,
+            ),
+        )
+        return parsers.parse_video_source_configuration_options(xml)
+
+    async def set_video_source_configuration(
+        self,
+        *,
+        token: str,
+        name: str,
+        source_token: str,
+        x: int = 0,
+        y: int = 0,
+        width: int = 0,
+        height: int = 0,
+        use_count: int | None = None,
+        rotate: str = "",
+        force_persistence: bool = True,
+    ) -> None:
+        """Set a video source configuration's crop bounds and optional rotation mode."""
+        service, use_media2 = await self._media_service()
+        await self.call(
+            service=service,
+            operation="SetVideoSourceConfiguration",
+            body_inner=envelopes.media_set_video_source_configuration(
+                token=token,
+                name=name,
+                source_token=source_token,
+                x=x,
+                y=y,
+                width=width,
+                height=height,
+                use_media2=use_media2,
+                use_count=use_count,
+                rotate=rotate,
+                force_persistence=force_persistence,
+            ),
+        )
+
+    async def get_compatible_video_encoder_configurations(
+        self, *, profile_token: str
+    ) -> list[dict[str, Any]]:
+        """Return the encoder configurations that may legally be added to a profile."""
+        await self._require_media1("GetCompatibleVideoEncoderConfigurations")
+        xml = await self.call(
+            service="media",
+            operation="GetCompatibleVideoEncoderConfigurations",
+            body_inner=envelopes.media_get_compatible_video_encoder_configurations(
+                profile_token=profile_token
+            ),
+        )
+        return parsers.parse_video_encoder_configurations(xml)
+
+    async def get_audio_encoder_configuration_options(
+        self, *, configuration_token: str = "", profile_token: str = ""
+    ) -> list[dict[str, Any]]:
+        """Return the encodings, bitrates and sample rates the audio encoder accepts."""
+        service, use_media2 = await self._media_service()
+        xml = await self.call(
+            service=service,
+            operation="GetAudioEncoderConfigurationOptions",
+            body_inner=envelopes.media_get_audio_encoder_configuration_options(
+                use_media2=use_media2,
+                configuration_token=configuration_token,
+                profile_token=profile_token,
+            ),
+        )
+        return parsers.parse_audio_encoder_configuration_options(xml)
+
+    async def get_guaranteed_number_of_video_encoder_instances(
+        self, *, configuration_token: str
+    ) -> dict[str, int | None]:
+        """Return how many simultaneous encoder instances a video source can guarantee."""
+        await self._require_media1("GetGuaranteedNumberOfVideoEncoderInstances")
+        xml = await self.call(
+            service="media",
+            operation="GetGuaranteedNumberOfVideoEncoderInstances",
+            body_inner=envelopes.media_get_guaranteed_number_of_video_encoder_instances(
+                configuration_token=configuration_token
+            ),
+        )
+        return parsers.parse_encoder_instances(xml)
+
+    async def media2_get_masks(self, *, configuration_token: str = "") -> list[dict[str, Any]]:
+        """Return the Media2 privacy masks, optionally scoped to one configuration."""
+        xml = await self.call(
+            service="media2",
+            operation="GetMasks",
+            body_inner=envelopes.media2_get_masks(configuration_token=configuration_token),
+        )
+        return parsers.parse_masks(xml)
+
+    async def media2_delete_mask(self, *, token: str) -> None:
+        """Delete a Media2 privacy mask by token."""
+        await self.call(
+            service="media2",
+            operation="DeleteMask",
+            body_inner=envelopes.media2_delete_mask(token=token),
+        )
+
+    async def get_endpoint_reference(self) -> str:
+        """Return the device's WS-Discovery endpoint reference GUID."""
+        xml = await self.call(
+            service="device",
+            operation="GetEndpointReference",
+            body_inner=envelopes.device_get_endpoint_reference(),
+        )
+        return parsers.parse_text_element(xml, "GUID")
+
+    async def get_storage_configurations(self) -> list[dict[str, Any]]:
+        """Return the device's configured storage targets (NFS/CIFS/local paths)."""
+        xml = await self.call(
+            service="device",
+            operation="GetStorageConfigurations",
+            body_inner=envelopes.device_get_storage_configurations(),
+        )
+        return parsers.parse_storage_configurations(xml)
+
+    async def imaging_get_move_options(self, *, video_source_token: str) -> dict[str, Any]:
+        """Return the focus move modes and ranges the imaging service supports."""
+        xml = await self.call(
+            service="imaging",
+            operation="GetMoveOptions",
+            body_inner=envelopes.imaging_get_move_options(video_source_token=video_source_token),
+        )
+        return parsers.parse_named_element(xml, "MoveOptions")
+
+    async def get_recording_options(self, *, recording_token: str) -> dict[str, Any]:
+        """Return the track and job capacity a recording still has available (Profile G)."""
+        xml = await self.call(
+            service="recording",
+            operation="GetRecordingOptions",
+            body_inner=envelopes.recording_get_recording_options(recording_token=recording_token),
+        )
+        return parsers.parse_named_element(xml, "Options")
+
+    async def start_firmware_upgrade(self) -> dict[str, str]:
+        """Begin a firmware upgrade and return where to upload the image.
+
+        The device replies with ``upload_uri``, ``upload_delay`` and ``expected_down_time``;
+        POST the firmware image to ``upload_uri`` yourself after waiting ``upload_delay``.
+        This reboots the device — there is no undo.
+        """
+        xml = await self.call(
+            service="device",
+            operation="StartFirmwareUpgrade",
+            body_inner=envelopes.device_start_firmware_upgrade(),
+        )
+        return parsers.parse_upload_target(xml)
+
+    async def start_system_restore(self) -> dict[str, str]:
+        """Begin a system restore and return where to upload the backup file.
+
+        Same shape as :meth:`start_firmware_upgrade`: POST the backup to ``upload_uri``.
+        This overwrites the device's configuration.
+        """
+        xml = await self.call(
+            service="device",
+            operation="StartSystemRestore",
+            body_inner=envelopes.device_start_system_restore(),
+        )
+        return parsers.parse_upload_target(xml)
+
+
+class AsyncPullPointSubscription:
+    """An asyncio pull-point subscription that renews itself and tidies up on exit.
+
+    The async counterpart of :class:`~onveef.client.PullPointSubscription`. Build one with
+    :meth:`AsyncOnvifClient.pull_point` rather than directly.
+    """
+
+    def __init__(
+        self,
+        client: AsyncOnvifClient,
+        *,
+        termination_time: str = "PT60S",
+        topic_filter: str = "",
+        timeout: str = "PT5S",
+        message_limit: int = 20,
+        auto_renew: bool = True,
+    ) -> None:
+        self._client = client
+        self._termination_time = termination_time
+        self._topic_filter = topic_filter
+        self._timeout = timeout
+        self._message_limit = message_limit
+        self._auto_renew = auto_renew
+        self._renew_interval_s = max(1.0, _iso8601_seconds(termination_time, 60.0) / 2)
+        self._renew_at = 0.0
+        self.subscription_url = ""
+
+    @property
+    def active(self) -> bool:
+        """Whether a subscription reference is currently held."""
+        return bool(self.subscription_url)
+
+    async def create(self) -> str:
+        """Create (or re-create) the subscription and return its reference URL."""
+        result = await self._client.events_create_pull_point(
+            termination_time=self._termination_time, topic_filter=self._topic_filter
+        )
+        url = str(result.get("subscription_url") or "")
+        if not url:
+            raise OnvifFaultError("Device returned a pull-point subscription with no reference.")
+        self.subscription_url = url
+        self._renew_at = time.monotonic() + self._renew_interval_s
+        return url
+
+    async def renew(self) -> None:
+        """Extend the subscription's termination time."""
+        if not self.subscription_url:
+            return
+        await self._client.events_renew(
+            subscription_url=self.subscription_url, termination_time=self._termination_time
+        )
+        self._renew_at = time.monotonic() + self._renew_interval_s
+
+    async def unsubscribe(self) -> None:
+        """Cancel the subscription, ignoring a device that has already forgotten it."""
+        url, self.subscription_url = self.subscription_url, ""
+        if not url:
+            return
+        try:
+            await self._client.events_unsubscribe(subscription_url=url)
+        except OnvifError as exc:
+            logger.debug("onveef: unsubscribe from %s failed (ignored): %s", url, exc)
+
+    async def set_synchronization_point(self) -> None:
+        """Ask the device to re-send the current state of every property it reports."""
+        if self.subscription_url:
+            await self._client.events_set_synchronization_point(
+                subscription_url=self.subscription_url
+            )
+
+    async def pull(self) -> list[dict[str, Any]]:
+        """Long-poll once and return the notifications received (possibly an empty list)."""
+        if not self.subscription_url:
+            await self.create()
+        if self._auto_renew and time.monotonic() >= self._renew_at:
+            try:
+                await self.renew()
+            except OnvifError as exc:
+                logger.debug("onveef: pull-point renew failed, will re-create: %s", exc)
+                self.subscription_url = ""
+                await self.create()
+        try:
+            result = await self._client.events_pull_messages(
+                subscription_url=self.subscription_url,
+                timeout=self._timeout,
+                message_limit=self._message_limit,
+            )
+        except (OnvifFaultError, OnvifOperationNotSupportedError) as exc:
+            logger.debug("onveef: pull-point rejected the pull, re-creating: %s", exc)
+            self.subscription_url = ""
+            await self.create()
+            result = await self._client.events_pull_messages(
+                subscription_url=self.subscription_url,
+                timeout=self._timeout,
+                message_limit=self._message_limit,
+            )
+        messages = result.get("messages")
+        return messages if isinstance(messages, list) else []
+
+    async def __aiter__(self) -> AsyncIterator[dict[str, Any]]:
+        """Yield notifications forever, blocking in the device's long poll between batches."""
+        while True:
+            for message in await self.pull():
+                yield message
+
+    async def __aenter__(self) -> AsyncPullPointSubscription:
+        if not self.subscription_url:
+            await self.create()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.unsubscribe()

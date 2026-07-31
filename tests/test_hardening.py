@@ -20,7 +20,13 @@ def _stub_by_operation(client: OnvifClient, responses: dict[str, str]) -> list[s
     """Stub ``_post_soap`` to answer with a response chosen by an operation marker in the envelope."""
     captured: list[str] = []
 
-    def fake_post_soap(*, url: str, envelope: str, content_type: str) -> tuple[int, str]:
+    def fake_post_soap(
+        *,
+        url: str,
+        envelope: str,
+        content_type: str,
+        read_timeout_s: float | None = None,
+    ) -> tuple[int, str]:
         captured.append(envelope)
         for marker, xml in responses.items():
             if marker in envelope:

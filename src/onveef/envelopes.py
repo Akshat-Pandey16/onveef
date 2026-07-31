@@ -230,9 +230,139 @@ def media_get_profiles(*, use_media2: bool) -> str:
     )
 
 
+def media_get_profile(*, profile_token: str) -> str:
+    """Build a legacy Media ``GetProfile`` request for one profile token.
+
+    Media2 has no single-profile operation; use ``media2_get_profiles`` and filter, or
+    call this against the Media1 service.
+    """
+    return (
+        "<trt:GetProfile>"
+        f"<trt:ProfileToken>{escape(profile_token)}</trt:ProfileToken>"
+        "</trt:GetProfile>"
+    )
+
+
 def media_get_video_sources(*, use_media2: bool) -> str:
     """Build a ``GetVideoSources`` request using the Media2 or legacy Media service."""
     return "<trt2:GetVideoSources/>" if use_media2 else "<trt:GetVideoSources/>"
+
+
+def media_get_video_source_configurations(*, use_media2: bool) -> str:
+    """Build a ``GetVideoSourceConfigurations`` request (Media2 or legacy Media)."""
+    return (
+        "<trt2:GetVideoSourceConfigurations/>"
+        if use_media2
+        else "<trt:GetVideoSourceConfigurations/>"
+    )
+
+
+def media_get_video_source_configuration_options(
+    *, use_media2: bool, configuration_token: str = "", profile_token: str = ""
+) -> str:
+    """Build a ``GetVideoSourceConfigurationOptions`` request scoped by the given tokens."""
+    prefix = "trt2" if use_media2 else "trt"
+    parts: list[str] = []
+    if configuration_token:
+        parts.append(
+            f"<{prefix}:ConfigurationToken>{escape(configuration_token)}</{prefix}:ConfigurationToken>"
+        )
+    if profile_token:
+        parts.append(f"<{prefix}:ProfileToken>{escape(profile_token)}</{prefix}:ProfileToken>")
+    op = f"{prefix}:GetVideoSourceConfigurationOptions"
+    if not parts:
+        return f"<{op}/>"
+    return f"<{op}>{''.join(parts)}</{op}>"
+
+
+def media_set_video_source_configuration(
+    *,
+    token: str,
+    name: str,
+    source_token: str,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    use_media2: bool = False,
+    use_count: int | None = None,
+    rotate: str = "",
+    force_persistence: bool = True,
+) -> str:
+    """Build a ``SetVideoSourceConfiguration`` request (rotation, crop bounds, source).
+
+    ``x``/``y``/``width``/``height`` are the ``tt:Bounds`` rectangle the configuration crops
+    from the video source. ``rotate`` may be ``OFF``, ``ON`` or ``AUTO``; leave it empty to
+    omit the extension entirely. ``force_persistence`` is Media1-only and ignored for Media2.
+    """
+    prefix = "trt2" if use_media2 else "trt"
+    attrs = f" token={quoteattr(token)}"
+    if use_count is not None:
+        attrs += f' UseCount="{int(use_count)}"'
+    extension = ""
+    if rotate:
+        extension = (
+            "<tt:Extension><tt:Rotate>"
+            f"<tt:Mode>{escape(rotate)}</tt:Mode>"
+            "</tt:Rotate></tt:Extension>"
+        )
+    bounds = f'<tt:Bounds x="{int(x)}" y="{int(y)}" width="{int(width)}" height="{int(height)}"/>'
+    body = (
+        f"<{prefix}:Configuration{attrs}>"
+        f"<tt:Name>{escape(name)}</tt:Name>"
+        f"<tt:SourceToken>{escape(source_token)}</tt:SourceToken>"
+        f"{bounds}{extension}"
+        f"</{prefix}:Configuration>"
+    )
+    if not use_media2:
+        body += (
+            f"<trt:ForcePersistence>{'true' if force_persistence else 'false'}"
+            "</trt:ForcePersistence>"
+        )
+    return f"<{prefix}:SetVideoSourceConfiguration>{body}</{prefix}:SetVideoSourceConfiguration>"
+
+
+def media_get_compatible_video_encoder_configurations(*, profile_token: str) -> str:
+    """Build a legacy Media ``GetCompatibleVideoEncoderConfigurations`` request.
+
+    Returns the encoder configurations that may legally be added to ``profile_token``.
+    """
+    return (
+        "<trt:GetCompatibleVideoEncoderConfigurations>"
+        f"<trt:ProfileToken>{escape(profile_token)}</trt:ProfileToken>"
+        "</trt:GetCompatibleVideoEncoderConfigurations>"
+    )
+
+
+def media_get_audio_encoder_configuration_options(
+    *, use_media2: bool, configuration_token: str = "", profile_token: str = ""
+) -> str:
+    """Build a ``GetAudioEncoderConfigurationOptions`` request scoped by the given tokens."""
+    prefix = "trt2" if use_media2 else "trt"
+    parts: list[str] = []
+    if configuration_token:
+        parts.append(
+            f"<{prefix}:ConfigurationToken>{escape(configuration_token)}</{prefix}:ConfigurationToken>"
+        )
+    if profile_token:
+        parts.append(f"<{prefix}:ProfileToken>{escape(profile_token)}</{prefix}:ProfileToken>")
+    op = f"{prefix}:GetAudioEncoderConfigurationOptions"
+    if not parts:
+        return f"<{op}/>"
+    return f"<{op}>{''.join(parts)}</{op}>"
+
+
+def media_get_guaranteed_number_of_video_encoder_instances(*, configuration_token: str) -> str:
+    """Build a legacy Media ``GetGuaranteedNumberOfVideoEncoderInstances`` request.
+
+    Tells you how many simultaneous encoder instances a video source configuration can
+    guarantee — the number that decides how many profiles you can usefully create.
+    """
+    return (
+        "<trt:GetGuaranteedNumberOfVideoEncoderInstances>"
+        f"<trt:ConfigurationToken>{escape(configuration_token)}</trt:ConfigurationToken>"
+        "</trt:GetGuaranteedNumberOfVideoEncoderInstances>"
+    )
 
 
 def media_get_video_encoder_configurations(*, use_media2: bool) -> str:
@@ -1034,6 +1164,24 @@ def device_set_system_factory_default(*, hard: bool = False) -> str:
     )
 
 
+def device_start_firmware_upgrade() -> str:
+    """Build a ``StartFirmwareUpgrade`` request.
+
+    The device replies with an upload URI, an upload delay and an expected downtime; you
+    then HTTP POST the firmware image to that URI yourself.
+    """
+    return "<tds:StartFirmwareUpgrade/>"
+
+
+def device_start_system_restore() -> str:
+    """Build a ``StartSystemRestore`` request.
+
+    Like ``StartFirmwareUpgrade``, the device replies with an upload URI to POST a backup
+    file to, plus the downtime to expect.
+    """
+    return "<tds:StartSystemRestore/>"
+
+
 def media_create_profile(*, name: str, token: str = "") -> str:
     """Build a legacy Media ``CreateProfile`` request named ``name``; ``token`` sets the profile token when given."""
     token_attr = f" token={quoteattr(token)}" if token else ""
@@ -1268,11 +1416,6 @@ def analytics_get_analytics_modules(*, configuration_token: str) -> str:
         f"<tan:ConfigurationToken>{escape(configuration_token)}</tan:ConfigurationToken>"
         "</tan:GetAnalyticsModules>"
     )
-
-
-def events_get_service_capabilities() -> str:
-    """Build a ``GetServiceCapabilities`` request for the events service."""
-    return "<tev:GetServiceCapabilities/>"
 
 
 def events_get_event_properties() -> str:
