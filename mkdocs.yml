@@ -1,10 +1,14 @@
 site_name: onveef
-site_description: A fast, zeep-free ONVIF client for IP cameras
+site_description: A fast, zeep-free ONVIF client library for Python — IP cameras, NVRs and VMS (Profile S/T/G/M/A/C), sync and async.
+# Required for canonical link tags and a non-empty sitemap.xml. Without it MkDocs
+# emits an empty <urlset>, so search engines are handed nothing to crawl.
+site_url: https://akshat-pandey16.github.io/onveef/
 repo_url: https://github.com/Akshat-Pandey16/onveef
 repo_name: Akshat-Pandey16/onveef
 
 theme:
   name: material
+  custom_dir: overrides
   features:
     - navigation.sections
     - navigation.top
@@ -54,3 +58,8 @@ markdown_extensions:
       permalink: true
   - pymdownx.highlight
   - pymdownx.superfences
+
+extra:
+  # Google Search Console "HTML tag" verification. Paste only the content="..." value
+  # from the meta tag Google shows you, then push — the tag is emitted on every page.
+  google_site_verification: "NlSeOe2hP3HGP-dYMGlRRW9eQLHEgHQo1J6YAMC1ZqU"

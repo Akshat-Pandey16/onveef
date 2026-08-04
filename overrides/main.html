@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+
+{#
+  Search-engine verification tokens. Set the value in mkdocs.yml under `extra:` —
+  nothing is emitted until you do, so an unconfigured build stays clean.
+#}
+{% block extrahead %}
+  {{ super() }}
+  {% if config.extra.google_site_verification %}
+    <meta name="google-site-verification" content="{{ config.extra.google_site_verification }}">
+  {% endif %}
+{% endblock %}
