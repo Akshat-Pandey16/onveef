@@ -33,12 +33,11 @@ jobs:
       - name: Install docs dependencies
         run: uv sync --extra docs
 
-      # enablement turns Pages on for the repo the first time this runs, so there is
-      # no manual step in repository settings.
+      # Pages is already enabled with "GitHub Actions" as its source. Do not add
+      # enablement: true here — GITHUB_TOKEN is not allowed to *create* a Pages site,
+      # so it fails the job rather than turning Pages on.
       - name: Configure Pages
         uses: actions/configure-pages@v5
-        with:
-          enablement: true
 
       - name: Build site
         run: uv run mkdocs build --strict
