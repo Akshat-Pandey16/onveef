@@ -1,14 +1,18 @@
-# onveef
+# onveef — a fast, zeep-free ONVIF client for Python
 
-**A fast, zeep-free ONVIF client for IP cameras.** No runtime WSDL parsing,
-near-instant import, sans-IO core, and only two runtime dependencies
-(`httpx` + `defusedxml`). Talks to ONVIF **Profile S / T / G / M / A / C** devices —
-device management, media & media2, PTZ, imaging, events, analytics, recording,
-replay, search, DeviceIO, physical access control, and WS-Discovery.
+**onveef** is a Python ONVIF library for IP cameras, NVRs and video management systems.
+No runtime WSDL parsing, near-instant import, a sans-IO core, and only two runtime
+dependencies (`httpx` + `defusedxml`). It talks to ONVIF **Profile S / T / G / M / A / C**
+devices — device management, media & media2, PTZ, imaging, events, analytics, recording,
+replay, search, DeviceIO, physical access control, and WS-Discovery — synchronously or on
+asyncio, with a CLI for everything.
 
-> `onveef` is a working name — rename freely (see [Renaming](#renaming)). This is a
-> client library **compatible with** ONVIF devices; it is **not** ONVIF-certified and
-> is not affiliated with or endorsed by the ONVIF trademark holder.
+> This is a client library **compatible with** ONVIF devices. It is **not** ONVIF-certified
+> and is not affiliated with or endorsed by the ONVIF trademark holder.
+
+[![PyPI](https://img.shields.io/pypi/v/onveef.svg)](https://pypi.org/project/onveef/)
+[![Python](https://img.shields.io/pypi/pyversions/onveef.svg)](https://pypi.org/project/onveef/)
+[![License](https://img.shields.io/pypi/l/onveef.svg)](LICENSE)
 
 ---
 
@@ -179,7 +183,28 @@ client.ptz_stop(profile_token=token)
 client.ptz_goto_preset(profile_token=token, preset_token="1")
 ```
 
-### Events (pull-point and push)
+Preset tours are fully writable — create the tour, then define it:
+
+```python
+tour = client.ptz_create_preset_tour(profile_token=token)
+client.ptz_modify_preset_tour(
+    profile_token=token,
+    preset_tour_token=tour,
+    name="Perimeter",
+    auto_start=True,
+    tour_spots=[
+        {"preset_token": "1", "stay_time": "PT10S"},
+        {"preset_token": "2", "stay_time": "PT10S"},
+        {"home": True, "stay_time": "PT30S"},
+    ],
+)
+client.ptz_operate_preset_tour(profile_token=token, preset_tour_token=tour, operation="Start")
+```
+
+On cameras that report a geo-location, `ptz_geo_move(profile_token=..., lat=..., lon=...)`
+aims at a coordinate rather than a pan/tilt position.
+
+### Events: pull-point *and* push
 
 A pull-point expires unless it is renewed. `pull_point()` hands back a managed
 subscription that renews at half the termination interval, re-creates itself if the device
@@ -197,25 +222,99 @@ async with client.pull_point(topic_filter="tns1:RuleEngine//.") as sub:
         print(message["topic"], message["data"])
 ```
 
-The unmanaged operations are still there if you want to drive the lifecycle yourself:
+For **push** delivery the device POSTs a WS-BaseNotification `Notify` envelope to a
+consumer address you host. `events_subscribe()` sets it up and
+`parsers.parse_notification()` decodes what arrives — the whole consumer is about twenty
+lines of ASGI:
+
+```python
+from onveef import OnvifClient, parsers
+
+async def consumer(scope, receive, send):
+    """Mount at http://<your-host>:9000/onvif-events."""
+    body = b""
+    while True:
+        event = await receive()
+        body += event.get("body", b"")
+        if not event.get("more_body"):
+            break
+    for message in parsers.parse_notification(body.decode("utf-8", "replace")):
+        print(message["topic"], message["utc_time"], message["data"])
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(b"content-type", b"text/xml")]})
+    await send({"type": "http.response.body", "body": b""})
+
+cam = OnvifClient("192.168.1.64", 80, "admin", "secret")
+sub = cam.events_subscribe(
+    consumer_address="http://192.0.2.10:9000/onvif-events",
+    topic_filter="tns1:RuleEngine//.",
+    termination_time="PT60S",
+)
+# ...renew before termination_time, or the device drops the subscription:
+cam.events_renew(subscription_url=sub["subscription_url"], termination_time="PT60S")
+cam.events_unsubscribe(subscription_url=sub["subscription_url"])
+```
+
+Push messages come back in exactly the shape `pull_point` yields (`topic`, `utc_time`,
+`property_operation`, `source`, `data`), so the same handler serves both. `parse_notification`
+never raises on malformed input — a consumer is exposed to the network.
+
+The unmanaged pull operations are still there if you want to drive that lifecycle yourself:
 
 ```python
 sub = client.events_create_pull_point(topic_filter="tns1:RuleEngine//.")
 msgs = client.events_pull_messages(subscription_url=sub["subscription_url"])
 client.events_renew(subscription_url=sub["subscription_url"])
+```
 
-# Base-notification push subscription (device POSTs to your consumer URL):
-sub = client.events_subscribe(consumer_address="http://my-host:9000/onvif-events")
+### Two-way audio (backchannel)
+
+Profile T's talk-down path needs a decoder configuration on the profile. Discover what the
+camera accepts, then wire it up:
+
+```python
+options = client.get_audio_decoder_configuration_options()   # {'g711': {...}, 'aac': {...}}
+decoder = client.get_audio_decoder_configurations()[0]
+client.add_audio_decoder_configuration(profile_token=token, configuration_token=decoder["token"])
+```
+
+The audio itself then travels over RTSP; ONVIF's job is only to enable the path.
+
+### Recording and replay (Profile G)
+
+```python
+recording = client.create_recording(source_id="cam1", source_name="Front door")
+track = client.create_track(recording_token=recording, track_type="Video")
+job = client.create_recording_job(recording_token=recording)
+print(client.get_recording_job_state(job_token=job))   # configured vs actually recording
+
+for attrs in client.get_media_attributes(recording_tokens=[recording]):
+    print(attrs["from"], attrs["until"], attrs["tracks"])   # what a timeline can seek within
+print(client.get_replay_uri(recording_token=recording))
 ```
 
 ### Physical Access Control (Profile A/C)
+
+Read state, command doors, and write the configuration behind them:
 
 ```python
 doors = client.get_door_info_list()          # paged; pass start_reference to page
 client.unlock_door(token="Door_1")
 print(client.get_door_state(token="Door_1"))
-print(client.get_access_point_state(token="AP_1"))
-client.enable_credential(token="Cred_1", reason="reinstated")
+
+schedule = client.create_schedule(
+    name="Office hours",
+    standard={"Monday": [{"from": "08:00:00", "until": "17:00:00"}]},
+)
+profile = client.create_access_profile(
+    name="Day staff",
+    policies=[{"schedule_token": schedule, "entity": "AP_1"}],
+)
+client.create_credential(
+    holder_reference="staff/42",
+    identifiers=[{"type": "Card", "format_type": "Wiegand26", "value": "1234"}],
+    access_profiles=[{"token": profile}],
+)
 ```
 
 ### Capabilities gating
@@ -259,28 +358,34 @@ retries, auth fallbacks, clock resync, and breaker events.
 
 | Service | Coverage | Notes |
 |---|---|---|
-| Device Management | ✅ full | info, services/capabilities discovery, datetime (+clock-skew), hostname, users, scopes, network, DNS/NTP, log, certs, dot1x, storage, endpoint reference, firmware upgrade & system restore |
-| Media (Profile S) | ✅ full | profiles (incl. single `GetProfile`), stream/snapshot URI, video/audio encoder get+set **and options**, video **source** configurations + options + set (crop, rotation), compatible configurations, encoder-instance guarantees, OSD, metadata, multicast |
-| Media2 (Profile T) | ✅ strong | profiles + create/delete, `AddConfiguration`/`RemoveConfiguration`, encoder options, privacy masks (get/delete), sync point |
-| PTZ | ✅ strong | continuous/absolute/relative, presets, home, aux, nodes, status, configurations |
-| Imaging | ✅ strong | settings/options/status, focus move/stop |
-| Events | ✅ strong | pull-point (+topic filter, sync point) **and** WS-BaseNotification `Subscribe` push |
-| Analytics | ✅ strong | rules & modules CRUD (SimpleItem + ElementItem params) |
-| Recording / Replay / Search (Profile G) | ✅ strong | recordings/jobs CRUD, recording options, replay URI/config, find sessions |
+| Device Management | ✅ full | info, services/capabilities discovery, datetime (+clock-skew), hostname, users, scopes, network, DNS/NTP, log, certs, dot1x, storage, zero-config, endpoint reference, geo-location, firmware upgrade & system restore |
+| Media (Profile S) | ✅ full | profiles (incl. single `GetProfile`), stream/snapshot URI, video **and audio** encoder/source configurations — get, options **and** set — video source **modes**, compatible configurations, encoder-instance guarantees, analytics-configuration attach, OSD, metadata, multicast |
+| Media2 (Profile T) | ✅ strong | profiles + create/delete, `AddConfiguration`/`RemoveConfiguration`, encoder options, audio decoder (backchannel) configurations, privacy masks (get/delete — create/modify pending), sync point |
+| PTZ | ✅ full | continuous/absolute/relative, presets, home, aux, nodes, status, configurations + options, preset tours (full CRUD + options), `GeoMove` |
+| Imaging | ✅ strong | settings/options/status, focus move/stop + move options, imaging presets |
+| Events | ✅ full | pull-point (managed, +topic filter, sync point) **and** WS-BaseNotification push — `Subscribe`, renew, unsubscribe, and `parse_notification()` for the `Notify` your consumer receives |
+| Analytics | ✅ strong | rules & modules CRUD (SimpleItem + ElementItem params), supported-rule/module **descriptions**, configuration attach/detach/set |
+| Recording / Replay / Search (Profile G) | ✅ strong | recordings/jobs CRUD, job **state**, track CRUD + configuration, recording options, `GetMediaAttributes`, replay URI/config, find sessions + search state |
 | DeviceIO | ✅ strong | relays (DeviceIO-aware), relay output options, digital inputs, serial ports |
-| Access Control / Door / Credential (Profile A/C) | ✅ strong | access points, areas, doors (+lock/unlock/block/lockdown), credentials |
+| Access Control / Door / Credential (Profile A/C) | ✅ strong | access points, areas, doors (+lock/unlock/block/lockdown), credentials **incl. create/modify**, schedules and special-day groups, access profiles |
 | WS-Discovery | ✅ full | multi-interface multicast Probe with retransmits, unicast probe, optional IPv6, ProbeMatch parsing |
 | Network | ✅ full | interfaces (IPv4 **and** IPv6), protocols, gateway, DNS, NTP |
 
-See `CHANGELOG.md` for what changed per release.
+Not covered yet: Media2 mask create/modify, receivers, and the authentication-behavior /
+credential-identifier-type corners of Profile A. See `CHANGELOG.md` for what changed per
+release.
 
 ---
 
 ## Design notes
 
 - **Sans-IO core.** `onveef.envelopes` and `onveef.parsers` never touch the
-  network. All I/O is in `onveef.client` (sync `httpx`). This makes the codec
-  fully testable from recorded XML.
+  network. All I/O is in the transport (`onveef.transport` / `onveef.atransport`). This
+  makes the codec fully testable from recorded XML.
+- **One file per service.** `OnvifClient` is composed from the transport core plus a mixin
+  per ONVIF service (`onveef.ops.media`, `onveef.ops.ptz`, …), with `onveef.aops` mirroring
+  them for asyncio — so operations are where you would look for them, not in one
+  3000-line class.
 - **Capability gating.** `OnvifEndpoint.has()/url()` and the client's service
   resolution raise a clean `OnvifCapabilityMissingError` instead of a device fault
   when a service is not advertised.
@@ -298,47 +403,20 @@ See `CHANGELOG.md` for what changed per release.
 - **Testable from the outside.** `transport=` accepts any `httpx` transport, so downstream
   projects can drive the full request path with `httpx.MockTransport` instead of
   monkeypatching internals.
-
----
-
-## Publishing
-
-Build and release instructions (build, TestPyPI rehearsal, PyPI upload, GitHub
-Actions trusted publishing, renaming) live in [`PUBLISHING.md`](PUBLISHING.md). TL;DR:
-
-```bash
-uv sync --extra dev
-uv run ruff check src tests && uv run mypy && uv run pytest -q
-uv build
-uv run twine check dist/*
-uv run twine upload --repository testpypi dist/*   # rehearse
-uv run twine upload dist/*                          # release
-```
+- **No silent empties.** A parser aimed at the wrong element returns `[]`, which reads as
+  "the camera supports nothing" rather than as a bug. The suite pins the wire format of
+  every response shape and fails the build if a builder or parser has no caller.
 
 ---
 
 ## Roadmap
 
-Delivered in 0.5: host rewriting, a CLI, managed pull-point subscriptions, per-request
-timeouts, transport injection, and WS-Discovery hardening. Next:
-
 - Grow the **vendor fixture matrix** with real captures (Hikvision / Dahua / Axis /
   Bosch / Reolink / Uniview / Amcrest). `onveef dump` captures a set in one command —
   see [`CONTRIBUTING.md`](CONTRIBUTING.md) for what to redact before opening a PR.
-- Access Control **write** ops (create/modify credentials, schedules, access profiles).
 - Media2 mask **create/modify** (get and delete are covered).
+- ONVIF **receivers** (`GetReceivers`, `CreateReceiver`) for NVR-side ingest.
 - A published API-reference site from the existing docstrings.
-
----
-
-## Renaming
-
-`onveef` is a placeholder. To rename to `<newname>`:
-
-```bash
-git grep -l onveef | xargs sed -i 's/onveef/<newname>/g'
-git mv src/onveef src/<newname>
-```
 
 ---
 

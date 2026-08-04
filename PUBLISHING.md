@@ -13,12 +13,9 @@ End-to-end guide for building and releasing this package. It assumes
      [TestPyPI](https://test.pypi.org/account/register/) (separate accounts).
    - Enable 2FA on both (required to upload).
 
-2. **Claim the name early.** Package names are first-come on PyPI. `onveef` is a
-   placeholder — pick your final name and reserve it before writing more code
-   (see [§7 Renaming](#7-renaming)). Do a quick availability check:
-   ```bash
-   pip index versions onveef        # or just open https://pypi.org/project/<name>/
-   ```
+2. **The distribution name is `onveef`**, already registered on PyPI:
+   <https://pypi.org/project/onveef/>. It does not lead with the ONVIF trademark,
+   which is deliberate — see §7.
 
 3. **Credentials — use API tokens, never your password.**
    - Create a token at <https://pypi.org/manage/account/token/> (scope it to the
@@ -187,28 +184,12 @@ to open a PR instead of pushing to `main`.
 
 ---
 
-## 7. Renaming
-
-`onveef` is a placeholder chosen to avoid leading with the ONVIF trademark. To
-rename to `<newname>` before first publish:
-
-```bash
-git grep -l onveef | xargs sed -i 's/onveef/<newname>/g'
-git mv src/onveef src/<newname>
-uv run pytest -q               # re-verify
-```
-
-Then update `[project].name` in `pyproject.toml` and the `[tool.hatch.build...]`
-`packages` path.
-
----
-
-## 8. Trademark / naming reminders
+## 7. Trademark / naming reminders
 
 - You may state the library is **"compatible with ONVIF Profile S/T/G/M devices."**
 - Do **not** claim it is "ONVIF conformant" or "ONVIF certified", and do not use
   the ONVIF logo — those require paid ONVIF membership and the official test tool.
-- Prefer a distribution name that does **not** lead with `onvif` to reduce
+- The name `onveef` deliberately does not lead with `onvif`, to avoid
   squatting/endorsement confusion.
 
 ---

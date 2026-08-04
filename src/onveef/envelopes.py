@@ -28,6 +28,8 @@ NS_DECL = (
     'xmlns:tac="http://www.onvif.org/ver10/accesscontrol/wsdl" '
     'xmlns:tdc="http://www.onvif.org/ver10/doorcontrol/wsdl" '
     'xmlns:tcr="http://www.onvif.org/ver10/credential/wsdl" '
+    'xmlns:tsc="http://www.onvif.org/ver10/schedule/wsdl" '
+    'xmlns:tar="http://www.onvif.org/ver10/accessrules/wsdl" '
     'xmlns:pt="http://www.onvif.org/ver10/pacs" '
     'xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" '
     'xmlns:tns1="http://www.onvif.org/ver10/topics" '
@@ -257,11 +259,10 @@ def media_get_video_source_configurations(*, use_media2: bool) -> str:
     )
 
 
-def media_get_video_source_configuration_options(
-    *, use_media2: bool, configuration_token: str = "", profile_token: str = ""
+def _token_scoped_body(
+    prefix: str, op: str, *, configuration_token: str = "", profile_token: str = ""
 ) -> str:
-    """Build a ``GetVideoSourceConfigurationOptions`` request scoped by the given tokens."""
-    prefix = "trt2" if use_media2 else "trt"
+    """Build ``<prefix:op>`` scoped by whichever of the two optional tokens were supplied."""
     parts: list[str] = []
     if configuration_token:
         parts.append(
@@ -269,10 +270,22 @@ def media_get_video_source_configuration_options(
         )
     if profile_token:
         parts.append(f"<{prefix}:ProfileToken>{escape(profile_token)}</{prefix}:ProfileToken>")
-    op = f"{prefix}:GetVideoSourceConfigurationOptions"
+    tag = f"{prefix}:{op}"
     if not parts:
-        return f"<{op}/>"
-    return f"<{op}>{''.join(parts)}</{op}>"
+        return f"<{tag}/>"
+    return f"<{tag}>{''.join(parts)}</{tag}>"
+
+
+def media_get_video_source_configuration_options(
+    *, use_media2: bool, configuration_token: str = "", profile_token: str = ""
+) -> str:
+    """Build a ``GetVideoSourceConfigurationOptions`` request scoped by the given tokens."""
+    return _token_scoped_body(
+        "trt2" if use_media2 else "trt",
+        "GetVideoSourceConfigurationOptions",
+        configuration_token=configuration_token,
+        profile_token=profile_token,
+    )
 
 
 def media_set_video_source_configuration(
@@ -338,18 +351,12 @@ def media_get_audio_encoder_configuration_options(
     *, use_media2: bool, configuration_token: str = "", profile_token: str = ""
 ) -> str:
     """Build a ``GetAudioEncoderConfigurationOptions`` request scoped by the given tokens."""
-    prefix = "trt2" if use_media2 else "trt"
-    parts: list[str] = []
-    if configuration_token:
-        parts.append(
-            f"<{prefix}:ConfigurationToken>{escape(configuration_token)}</{prefix}:ConfigurationToken>"
-        )
-    if profile_token:
-        parts.append(f"<{prefix}:ProfileToken>{escape(profile_token)}</{prefix}:ProfileToken>")
-    op = f"{prefix}:GetAudioEncoderConfigurationOptions"
-    if not parts:
-        return f"<{op}/>"
-    return f"<{op}>{''.join(parts)}</{op}>"
+    return _token_scoped_body(
+        "trt2" if use_media2 else "trt",
+        "GetAudioEncoderConfigurationOptions",
+        configuration_token=configuration_token,
+        profile_token=profile_token,
+    )
 
 
 def media_get_guaranteed_number_of_video_encoder_instances(*, configuration_token: str) -> str:
@@ -597,6 +604,16 @@ def ptz_get_status(*, profile_token: str) -> str:
         f"<tptz:ProfileToken>{escape(profile_token)}</tptz:ProfileToken>"
         "</tptz:GetStatus>"
     )
+
+
+def _as_float(value: object) -> float | None:
+    """Coerce a caller-supplied mapping value to a float, or ``None`` when absent/unusable."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 def _vector(pan: float | None, tilt: float | None, zoom: float | None) -> str:
@@ -958,16 +975,21 @@ def imaging_move(
     ``focus_continuous`` (continuous at that speed), ``focus_absolute`` (to a position),
     or ``focus_relative`` (by a distance); ``speed`` applies to the absolute/relative
     modes.
+
+    Focus values are ``xs:float`` *child elements* — unlike the PTZ vectors, which really
+    are ``x=``/``y=`` attributes. Devices reject the attribute form as malformed.
     """
+    speed_block = f"<tt:Speed>{speed}</tt:Speed>" if speed is not None else ""
     if focus_continuous is not None:
-        speed_attr = f' x="{focus_continuous}"'
-        focus_block = f"<tt:Continuous{speed_attr}/>"
+        focus_block = f"<tt:Continuous><tt:Speed>{focus_continuous}</tt:Speed></tt:Continuous>"
     elif focus_absolute is not None:
-        speed_block = f'<tt:Speed x="{speed}"/>' if speed is not None else ""
-        focus_block = f'<tt:Absolute><tt:Position x="{focus_absolute}"/>{speed_block}</tt:Absolute>'
+        focus_block = (
+            f"<tt:Absolute><tt:Position>{focus_absolute}</tt:Position>{speed_block}</tt:Absolute>"
+        )
     elif focus_relative is not None:
-        speed_block = f'<tt:Speed x="{speed}"/>' if speed is not None else ""
-        focus_block = f'<tt:Relative><tt:Distance x="{focus_relative}"/>{speed_block}</tt:Relative>'
+        focus_block = (
+            f"<tt:Relative><tt:Distance>{focus_relative}</tt:Distance>{speed_block}</tt:Relative>"
+        )
     else:
         focus_block = ""
     return (
@@ -2665,4 +2687,455 @@ def ptz_operate_preset_tour(*, profile_token: str, preset_tour_token: str, opera
         f"<tptz:PresetTourToken>{escape(preset_tour_token)}</tptz:PresetTourToken>"
         f"<tptz:Operation>{escape(operation)}</tptz:Operation>"
         "</tptz:OperatePresetTour>"
+    )
+
+
+def media_get_audio_source_configurations(*, use_media2: bool) -> str:
+    """Build a ``GetAudioSourceConfigurations`` request (Media2 or legacy Media).
+
+    The configurations it returns carry the tokens
+    :func:`media_add_audio_source_configuration` needs.
+    """
+    return (
+        "<trt2:GetAudioSourceConfigurations/>"
+        if use_media2
+        else "<trt:GetAudioSourceConfigurations/>"
+    )
+
+
+def media_get_audio_source_configuration_options(
+    *, use_media2: bool, configuration_token: str = "", profile_token: str = ""
+) -> str:
+    """Build a ``GetAudioSourceConfigurationOptions`` request scoped by the given tokens."""
+    return _token_scoped_body(
+        "trt2" if use_media2 else "trt",
+        "GetAudioSourceConfigurationOptions",
+        configuration_token=configuration_token,
+        profile_token=profile_token,
+    )
+
+
+def media_set_audio_source_configuration(
+    *,
+    token: str,
+    name: str,
+    source_token: str,
+    use_media2: bool = False,
+    use_count: int = 0,
+    force_persistence: bool = True,
+) -> str:
+    """Build a ``SetAudioSourceConfiguration`` request pointing ``token`` at ``source_token``.
+
+    ``force_persistence`` is Media1-only and ignored for Media2.
+    """
+    prefix = "trt2" if use_media2 else "trt"
+    persistence = (
+        ""
+        if use_media2
+        else f"<trt:ForcePersistence>{'true' if force_persistence else 'false'}</trt:ForcePersistence>"
+    )
+    return (
+        f"<{prefix}:SetAudioSourceConfiguration>"
+        f"<{prefix}:Configuration token={quoteattr(token)}>"
+        f"<tt:Name>{escape(name)}</tt:Name>"
+        f"<tt:UseCount>{int(use_count)}</tt:UseCount>"
+        f"<tt:SourceToken>{escape(source_token)}</tt:SourceToken>"
+        f"</{prefix}:Configuration>"
+        f"{persistence}"
+        f"</{prefix}:SetAudioSourceConfiguration>"
+    )
+
+
+def media_get_audio_output_configuration_options(
+    *, use_media2: bool = False, configuration_token: str = "", profile_token: str = ""
+) -> str:
+    """Build a ``GetAudioOutputConfigurationOptions`` request scoped by the given tokens."""
+    return _token_scoped_body(
+        "trt2" if use_media2 else "trt",
+        "GetAudioOutputConfigurationOptions",
+        configuration_token=configuration_token,
+        profile_token=profile_token,
+    )
+
+
+def media_get_video_source_modes(*, video_source_token: str, use_media2: bool = False) -> str:
+    """Build a ``GetVideoSourceModes`` request listing the sensor modes of ``video_source_token``.
+
+    A source mode fixes the aspect ratio and maximum resolution/framerate the encoder may
+    then be configured within, so encoder options that look unavailable often just need a
+    different mode selected first.
+    """
+    prefix = "trt2" if use_media2 else "trt"
+    return (
+        f"<{prefix}:GetVideoSourceModes>"
+        f"<{prefix}:VideoSourceToken>{escape(video_source_token)}</{prefix}:VideoSourceToken>"
+        f"</{prefix}:GetVideoSourceModes>"
+    )
+
+
+def media_set_video_source_mode(
+    *, video_source_token: str, mode_token: str, use_media2: bool = False
+) -> str:
+    """Build a ``SetVideoSourceMode`` request switching ``video_source_token`` to ``mode_token``."""
+    prefix = "trt2" if use_media2 else "trt"
+    return (
+        f"<{prefix}:SetVideoSourceMode>"
+        f"<{prefix}:VideoSourceToken>{escape(video_source_token)}</{prefix}:VideoSourceToken>"
+        f"<{prefix}:VideoSourceModeToken>{escape(mode_token)}</{prefix}:VideoSourceModeToken>"
+        f"</{prefix}:SetVideoSourceMode>"
+    )
+
+
+def media_get_audio_decoder_configurations(*, use_media2: bool = False) -> str:
+    """Build a ``GetAudioDecoderConfigurations`` request (the audio backchannel decoders)."""
+    return (
+        "<trt2:GetAudioDecoderConfigurations/>"
+        if use_media2
+        else "<trt:GetAudioDecoderConfigurations/>"
+    )
+
+
+def media_get_audio_decoder_configuration(*, configuration_token: str) -> str:
+    """Build a legacy Media ``GetAudioDecoderConfiguration`` request for one decoder token."""
+    return (
+        "<trt:GetAudioDecoderConfiguration>"
+        f"<trt:ConfigurationToken>{escape(configuration_token)}</trt:ConfigurationToken>"
+        "</trt:GetAudioDecoderConfiguration>"
+    )
+
+
+def media_get_audio_decoder_configuration_options(
+    *, use_media2: bool = False, configuration_token: str = "", profile_token: str = ""
+) -> str:
+    """Build a ``GetAudioDecoderConfigurationOptions`` request scoped by the given tokens.
+
+    The reply says which codecs (AAC/G.711/G.726) the device will *accept* on the
+    backchannel, and at which bitrates and sample rates.
+    """
+    return _token_scoped_body(
+        "trt2" if use_media2 else "trt",
+        "GetAudioDecoderConfigurationOptions",
+        configuration_token=configuration_token,
+        profile_token=profile_token,
+    )
+
+
+def media_set_audio_decoder_configuration(
+    *,
+    token: str,
+    name: str,
+    use_media2: bool = False,
+    use_count: int = 0,
+    force_persistence: bool = True,
+) -> str:
+    """Build a ``SetAudioDecoderConfiguration`` request renaming/persisting decoder ``token``."""
+    prefix = "trt2" if use_media2 else "trt"
+    persistence = (
+        ""
+        if use_media2
+        else f"<trt:ForcePersistence>{'true' if force_persistence else 'false'}</trt:ForcePersistence>"
+    )
+    return (
+        f"<{prefix}:SetAudioDecoderConfiguration>"
+        f"<{prefix}:Configuration token={quoteattr(token)}>"
+        f"<tt:Name>{escape(name)}</tt:Name>"
+        f"<tt:UseCount>{int(use_count)}</tt:UseCount>"
+        f"</{prefix}:Configuration>"
+        f"{persistence}"
+        f"</{prefix}:SetAudioDecoderConfiguration>"
+    )
+
+
+def media_add_audio_decoder_configuration(*, profile_token: str, configuration_token: str) -> str:
+    """Build an ``AddAudioDecoderConfiguration`` request wiring a backchannel decoder into ``profile_token``."""
+    return (
+        "<trt:AddAudioDecoderConfiguration>"
+        f"<trt:ProfileToken>{escape(profile_token)}</trt:ProfileToken>"
+        f"<trt:ConfigurationToken>{escape(configuration_token)}</trt:ConfigurationToken>"
+        "</trt:AddAudioDecoderConfiguration>"
+    )
+
+
+def media_remove_audio_decoder_configuration(*, profile_token: str) -> str:
+    """Build a ``RemoveAudioDecoderConfiguration`` request removing the decoder from ``profile_token``."""
+    return (
+        "<trt:RemoveAudioDecoderConfiguration>"
+        f"<trt:ProfileToken>{escape(profile_token)}</trt:ProfileToken>"
+        "</trt:RemoveAudioDecoderConfiguration>"
+    )
+
+
+def media_add_video_analytics_configuration(*, profile_token: str, configuration_token: str) -> str:
+    """Build an ``AddVideoAnalyticsConfiguration`` request attaching an analytics config to ``profile_token``."""
+    return (
+        "<trt:AddVideoAnalyticsConfiguration>"
+        f"<trt:ProfileToken>{escape(profile_token)}</trt:ProfileToken>"
+        f"<trt:ConfigurationToken>{escape(configuration_token)}</trt:ConfigurationToken>"
+        "</trt:AddVideoAnalyticsConfiguration>"
+    )
+
+
+def media_remove_video_analytics_configuration(*, profile_token: str) -> str:
+    """Build a ``RemoveVideoAnalyticsConfiguration`` request detaching the analytics config from ``profile_token``."""
+    return (
+        "<trt:RemoveVideoAnalyticsConfiguration>"
+        f"<trt:ProfileToken>{escape(profile_token)}</trt:ProfileToken>"
+        "</trt:RemoveVideoAnalyticsConfiguration>"
+    )
+
+
+def media_set_video_analytics_configuration(
+    *,
+    token: str,
+    name: str,
+    modules: list[dict[str, object]] | None = None,
+    rules: list[dict[str, object]] | None = None,
+    use_count: int = 0,
+    force_persistence: bool = True,
+) -> str:
+    """Build a legacy Media ``SetVideoAnalyticsConfiguration`` request.
+
+    Replaces the whole configuration ``token``: its ``name`` plus the analytics engine
+    (``modules``) and rule engine (``rules``) blocks, each item a dict of ``name``,
+    ``type`` and a ``parameters`` mapping — the same shape the Analytics service's own
+    module and rule operations take.
+    """
+    return (
+        "<trt:SetVideoAnalyticsConfiguration>"
+        f"<trt:Configuration token={quoteattr(token)}>"
+        f"<tt:Name>{escape(name)}</tt:Name>"
+        f"<tt:UseCount>{int(use_count)}</tt:UseCount>"
+        "<tt:AnalyticsEngineConfiguration>"
+        f"{_config_items_xml(modules or [], wrapper_tag='tt:AnalyticsModule')}"
+        "</tt:AnalyticsEngineConfiguration>"
+        "<tt:RuleEngineConfiguration>"
+        f"{_config_items_xml(rules or [], wrapper_tag='tt:Rule')}"
+        "</tt:RuleEngineConfiguration>"
+        "</trt:Configuration>"
+        f"<trt:ForcePersistence>{'true' if force_persistence else 'false'}</trt:ForcePersistence>"
+        "</trt:SetVideoAnalyticsConfiguration>"
+    )
+
+
+def _track_configuration_xml(*, track_type: str, description: str) -> str:
+    return (
+        "<trc:TrackConfiguration>"
+        f"<tt:TrackType>{escape(track_type)}</tt:TrackType>"
+        f"<tt:Description>{escape(description)}</tt:Description>"
+        "</trc:TrackConfiguration>"
+    )
+
+
+def recording_get_track_configuration(*, recording_token: str, track_token: str) -> str:
+    """Build a ``GetTrackConfiguration`` request for one track of ``recording_token``."""
+    return (
+        "<trc:GetTrackConfiguration>"
+        f"<trc:RecordingToken>{escape(recording_token)}</trc:RecordingToken>"
+        f"<trc:TrackToken>{escape(track_token)}</trc:TrackToken>"
+        "</trc:GetTrackConfiguration>"
+    )
+
+
+def recording_set_track_configuration(
+    *, recording_token: str, track_token: str, track_type: str, description: str = ""
+) -> str:
+    """Build a ``SetTrackConfiguration`` request setting a track's type and description."""
+    return (
+        "<trc:SetTrackConfiguration>"
+        f"<trc:RecordingToken>{escape(recording_token)}</trc:RecordingToken>"
+        f"<trc:TrackToken>{escape(track_token)}</trc:TrackToken>"
+        f"{_track_configuration_xml(track_type=track_type, description=description)}"
+        "</trc:SetTrackConfiguration>"
+    )
+
+
+def recording_create_track(*, recording_token: str, track_type: str, description: str = "") -> str:
+    """Build a ``CreateTrack`` request adding a ``track_type`` track to ``recording_token``.
+
+    ``track_type`` is one of ``Video``, ``Audio``, ``Metadata`` or ``Extended``.
+    """
+    return (
+        "<trc:CreateTrack>"
+        f"<trc:RecordingToken>{escape(recording_token)}</trc:RecordingToken>"
+        f"{_track_configuration_xml(track_type=track_type, description=description)}"
+        "</trc:CreateTrack>"
+    )
+
+
+def recording_delete_track(*, recording_token: str, track_token: str) -> str:
+    """Build a ``DeleteTrack`` request removing ``track_token`` from ``recording_token``."""
+    return (
+        "<trc:DeleteTrack>"
+        f"<trc:RecordingToken>{escape(recording_token)}</trc:RecordingToken>"
+        f"<trc:TrackToken>{escape(track_token)}</trc:TrackToken>"
+        "</trc:DeleteTrack>"
+    )
+
+
+def recording_get_recording_job_state(*, job_token: str) -> str:
+    """Build a ``GetRecordingJobState`` request asking whether ``job_token`` is actually recording."""
+    return (
+        "<trc:GetRecordingJobState>"
+        f"<trc:JobToken>{escape(job_token)}</trc:JobToken>"
+        "</trc:GetRecordingJobState>"
+    )
+
+
+def search_get_search_state(*, search_token: str) -> str:
+    """Build a ``GetSearchState`` request for the search session ``search_token``."""
+    return (
+        "<tse:GetSearchState>"
+        f"<tse:SearchToken>{escape(search_token)}</tse:SearchToken>"
+        "</tse:GetSearchState>"
+    )
+
+
+def search_get_media_attributes(
+    *, recording_tokens: list[str] | None = None, time: str = "", include_all: bool = False
+) -> str:
+    """Build a ``GetMediaAttributes`` request.
+
+    This is the call that reports a recording's real time span and per-track codecs — what
+    a replay timeline needs in order to seek rather than guess. Pass ``recording_tokens``
+    to scope it, ``include_all`` to ask for every recording the device holds, and ``time``
+    (an ISO-8601 timestamp) as the point the attributes are evaluated at.
+    """
+    tokens_xml = "".join(
+        f"<tse:RecordingTokens>{escape(t)}</tse:RecordingTokens>" for t in (recording_tokens or [])
+    )
+    time_xml = f"<tse:Time>{escape(time)}</tse:Time>" if time else ""
+    return (
+        "<tse:GetMediaAttributes>"
+        f"{tokens_xml}{time_xml}"
+        f"<tse:IncludeAllTracks>{'true' if include_all else 'false'}</tse:IncludeAllTracks>"
+        "</tse:GetMediaAttributes>"
+    )
+
+
+def ptz_create_preset_tour(*, profile_token: str) -> str:
+    """Build a ``CreatePresetTour`` request; the device replies with the new tour's token."""
+    return (
+        "<tptz:CreatePresetTour>"
+        f"<tptz:ProfileToken>{escape(profile_token)}</tptz:ProfileToken>"
+        "</tptz:CreatePresetTour>"
+    )
+
+
+def ptz_modify_preset_tour(
+    *,
+    profile_token: str,
+    preset_tour_token: str,
+    name: str = "",
+    auto_start: bool = False,
+    state: str = "Idle",
+    recurring_time: int | None = None,
+    recurring_duration: str = "",
+    direction: str = "",
+    random_order: bool | None = None,
+    tour_spots: list[dict[str, object]] | None = None,
+) -> str:
+    """Build a ``ModifyPresetTour`` request describing a tour in full.
+
+    ONVIF has no partial update here: the ``PresetTour`` element you send replaces the
+    stored one, so pass every field you want kept. Each entry in ``tour_spots`` is a dict
+    of ``preset_token`` (or ``home: True``), an optional ``stay_time`` (ISO-8601 duration)
+    and optional ``pan``/``tilt``/``zoom`` move speeds.
+    """
+    condition_parts: list[str] = []
+    if recurring_time is not None:
+        condition_parts.append(f"<tt:RecurringTime>{int(recurring_time)}</tt:RecurringTime>")
+    if recurring_duration:
+        condition_parts.append(
+            f"<tt:RecurringDuration>{escape(recurring_duration)}</tt:RecurringDuration>"
+        )
+    if direction:
+        condition_parts.append(f"<tt:Direction>{escape(direction)}</tt:Direction>")
+    random_attr = (
+        f' RandomPresetOrder="{"true" if random_order else "false"}"'
+        if random_order is not None
+        else ""
+    )
+    spots: list[str] = []
+    for spot in tour_spots or []:
+        if spot.get("home"):
+            detail = "<tt:Home/>"
+        else:
+            detail = f"<tt:PresetToken>{escape(str(spot.get('preset_token', '')))}</tt:PresetToken>"
+        speed = _vector(
+            _as_float(spot.get("pan")), _as_float(spot.get("tilt")), _as_float(spot.get("zoom"))
+        )
+        speed_xml = f"<tt:Speed>{speed}</tt:Speed>" if speed else ""
+        stay = spot.get("stay_time")
+        stay_xml = f"<tt:StayTime>{escape(str(stay))}</tt:StayTime>" if stay else ""
+        spots.append(
+            f"<tt:TourSpot><tt:PresetDetail>{detail}</tt:PresetDetail>{speed_xml}{stay_xml}</tt:TourSpot>"
+        )
+    name_xml = f"<tt:Name>{escape(name)}</tt:Name>" if name else ""
+    return (
+        "<tptz:ModifyPresetTour>"
+        f"<tptz:ProfileToken>{escape(profile_token)}</tptz:ProfileToken>"
+        f"<tptz:PresetTour token={quoteattr(preset_tour_token)}>"
+        f"{name_xml}"
+        f"<tt:Status><tt:State>{escape(state)}</tt:State></tt:Status>"
+        f"<tt:AutoStart>{'true' if auto_start else 'false'}</tt:AutoStart>"
+        f"<tt:StartingCondition{random_attr}>{''.join(condition_parts)}</tt:StartingCondition>"
+        f"{''.join(spots)}"
+        "</tptz:PresetTour>"
+        "</tptz:ModifyPresetTour>"
+    )
+
+
+def ptz_remove_preset_tour(*, profile_token: str, preset_tour_token: str) -> str:
+    """Build a ``RemovePresetTour`` request deleting ``preset_tour_token``."""
+    return (
+        "<tptz:RemovePresetTour>"
+        f"<tptz:ProfileToken>{escape(profile_token)}</tptz:ProfileToken>"
+        f"<tptz:PresetTourToken>{escape(preset_tour_token)}</tptz:PresetTourToken>"
+        "</tptz:RemovePresetTour>"
+    )
+
+
+def ptz_get_preset_tour_options(*, profile_token: str, preset_tour_token: str = "") -> str:
+    """Build a ``GetPresetTourOptions`` request reporting the limits a tour must stay within."""
+    token_xml = (
+        f"<tptz:PresetTourToken>{escape(preset_tour_token)}</tptz:PresetTourToken>"
+        if preset_tour_token
+        else ""
+    )
+    return (
+        "<tptz:GetPresetTourOptions>"
+        f"<tptz:ProfileToken>{escape(profile_token)}</tptz:ProfileToken>"
+        f"{token_xml}"
+        "</tptz:GetPresetTourOptions>"
+    )
+
+
+def ptz_geo_move(
+    *,
+    profile_token: str,
+    lat: float,
+    lon: float,
+    elevation: float = 0.0,
+    pan_speed: float | None = None,
+    tilt_speed: float | None = None,
+    zoom_speed: float | None = None,
+    area_height: float | None = None,
+    area_width: float | None = None,
+) -> str:
+    """Build a ``GeoMove`` request aiming the camera at a geographic coordinate (Profile T).
+
+    The device does the geometry itself using its own geo-location and orientation, so this
+    only works on cameras that report one — see :func:`device_get_geo_location`.
+    ``area_height``/``area_width`` (metres) ask it to frame an area rather than a point.
+    """
+    speed = _vector(pan_speed, tilt_speed, zoom_speed)
+    speed_xml = f"<tptz:Speed>{speed}</tptz:Speed>" if speed else ""
+    height_xml = f"<tptz:AreaHeight>{area_height}</tptz:AreaHeight>" if area_height else ""
+    width_xml = f"<tptz:AreaWidth>{area_width}</tptz:AreaWidth>" if area_width else ""
+    return (
+        "<tptz:GeoMove>"
+        f"<tptz:ProfileToken>{escape(profile_token)}</tptz:ProfileToken>"
+        f'<tptz:Target lon="{lon}" lat="{lat}" elevation="{elevation}"/>'
+        f"{speed_xml}{height_xml}{width_xml}"
+        "</tptz:GeoMove>"
     )

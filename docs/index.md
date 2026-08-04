@@ -30,5 +30,18 @@ address is re-pointed at the host you connected to — see [`onveef.urls`](api/h
 the client, so a 60-second poll cannot affect calls running concurrently beside it.
 
 **The core never touches the network.** `onveef.envelopes` builds request strings and
-`onveef.parsers` reads response strings; all I/O lives in the clients. That is what makes
+`onveef.parsers` reads response strings; all I/O lives in the transport. That is what makes
 device behaviour verifiable from recorded XML.
+
+## How the package is laid out
+
+| Module | Holds |
+|---|---|
+| `onveef.client` / `onveef.aclient` | `OnvifClient` / `AsyncOnvifClient` — the classes you import |
+| `onveef.transport` / `onveef.atransport` | Endpoints, credentials, auth, retries, breaker, fault handling |
+| `onveef.ops.*` / `onveef.aops.*` | One mixin per ONVIF service: `device`, `media`, `ptz`, `imaging`, `events`, `analytics`, `recording`, `accesscontrol` |
+| `onveef.envelopes` / `onveef.parsers` / `onveef.pacs` | The sans-IO codec |
+| `onveef.urls`, `onveef.wsdiscovery`, `onveef.models`, `onveef.breaker` | Helpers |
+
+The mixins are an implementation detail of how the source is organised — every operation
+is reachable on the client itself, and every import path is the one it has always been.

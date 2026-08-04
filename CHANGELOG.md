@@ -4,6 +4,88 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/) (0.x while the API stabilises).
 
+## [0.6.0]
+
+### Added
+- **Push events are complete.** `parsers.parse_notification()` decodes the
+  WS-BaseNotification `Notify` envelope a device POSTs to your consumer, returning the
+  same message dicts `PullMessages` yields, and never raising on malformed input.
+  `events_subscribe()` now parses its reply with the new `parsers.parse_subscribe()`
+  (which also surfaces `reference_parameters`) and host-rewrites the returned
+  subscription-manager URL like every other device-reported address. The README carries a
+  twenty-line ASGI consumer. Previously the coverage table claimed "pull-point and push"
+  while the push half stopped at the `Subscribe` request.
+- **Audio source and output configurations**, closing on the audio side the gap 0.5.0
+  closed for video — you could add an audio source configuration to a profile but had no
+  way to discover its token: `get_audio_source_configurations`,
+  `get_audio_source_configuration_options`, `set_audio_source_configuration` and
+  `get_audio_output_configuration_options`.
+- **Audio backchannel (Profile T two-way audio)**: `get_audio_decoder_configurations`,
+  `get_audio_decoder_configuration`, `get_audio_decoder_configuration_options`,
+  `set_audio_decoder_configuration`, `add_audio_decoder_configuration` and
+  `remove_audio_decoder_configuration`. Intercoms, doorbells and talk-down were previously
+  unreachable.
+- **Video source modes**: `get_video_source_modes` / `set_video_source_mode`. Cameras gate
+  encoder resolutions behind the active sensor mode, so resolutions a camera clearly
+  supports could not be reached — or even seen — at all.
+- **Profile G completion**: `create_track`, `delete_track`, `get_track_configuration`,
+  `set_track_configuration`, `get_recording_job_state` (configured vs actually recording),
+  `get_search_state`, and `get_media_attributes` — the operation that reports a
+  recording's real time span and per-track codecs, without which a replay timeline is
+  guesswork.
+- **PTZ preset tours are writable**: `ptz_create_preset_tour`, `ptz_modify_preset_tour`
+  (name, start condition, tour spots), `ptz_remove_preset_tour`,
+  `ptz_get_preset_tour_options`, plus the single-tour `ptz_get_preset_tour` whose builder
+  had shipped with no client method. Tours could previously only be run, not configured.
+- **`ptz_geo_move`** (Profile T geo-positioning), the PTZ counterpart to the
+  `get_geo_location`/`set_geo_location` already present on the device side.
+- **Analytics configurations can be attached to profiles**:
+  `add_video_analytics_configuration`, `remove_video_analytics_configuration` and
+  `set_video_analytics_configuration`. Rule and module CRUD only ever edited a
+  configuration the camera already had wired up.
+- **Profile A write operations**: `create_credential`/`modify_credential`/`get_credentials`;
+  schedules (`get_schedule_info_list`, `get_schedules`, `get_schedule_state`,
+  `create_schedule`, `modify_schedule`, `delete_schedule`) and special-day groups; access
+  profiles (`get_access_profile_info_list`, `get_access_profiles`, `create_access_profile`,
+  `modify_access_profile`, `delete_access_profile`); plus `get_access_points` and
+  `get_doors`. The Schedule and Access Rules services are now resolved and routed to.
+
+### Fixed
+- **`GetSupportedAnalyticsModules` and `GetSupportedRules` always returned `[]`.** Both
+  were parsed with the *configured*-item parsers, which look for `AnalyticsModule` and
+  `Rule`; the responses carry `AnalyticsModuleDescription` and `RuleDescription`. There was
+  no error — the result read as "this camera supports no analytics". New
+  `parse_supported_analytics_modules` / `parse_supported_rules` return each type's name,
+  `fixed`/`max_instances`, its parameters as name-to-XSD-type, and the messages it emits.
+- **`imaging_move` sent focus values devices reject.** Position, distance and speed were
+  emitted as `x=` attributes, carried over from the PTZ vector helper; ONVIF's
+  `AbsoluteFocus`/`RelativeFocus`/`ContinuousFocus` take `xs:float` **child elements**.
+  PTZ vectors, which genuinely are attributes, are unchanged.
+- `ptz_get_configuration_options`, `imaging_get_move_options` and `get_zero_configuration`
+  returned shapes that depended on how many children the device sent — one option came back
+  as a string, two as a list. Each now has a dedicated parser with a stable shape (the full
+  tree is still available under `raw`).
+
+### Changed
+- **The client is split by service.** `OnvifClient` is now composed from a transport core
+  (`onveef.transport`) plus one mixin per ONVIF service (`onveef.ops.device`,
+  `onveef.ops.media`, `onveef.ops.ptz`, `onveef.ops.imaging`, `onveef.ops.events`,
+  `onveef.ops.analytics`, `onveef.ops.recording`, `onveef.ops.accesscontrol`), with
+  `onveef.atransport` / `onveef.aops` mirroring them for asyncio. Two 3300-line modules
+  became navigable files of a few hundred lines each. **Every public import path is
+  unchanged** — `from onveef.client import OnvifClient, OnvifCredentials, OnvifEndpoint`
+  and `from onveef import ...` work exactly as before.
+- `parse_preset_tours` now also returns each tour's `starting_condition` and `tour_spots`.
+- Package metadata: `Development Status :: 4 - Beta` (was Alpha), broader keywords, and a
+  description that names what the library is.
+- The README no longer describes the project name as a placeholder; `onveef` is the name.
+
+### Testing
+- A test now fails the build if any builder or parser in `envelopes`, `parsers` or `pacs`
+  has no caller — the check that would have caught `ptz_get_preset_tour` shipping
+  unreachable.
+- 774 tests at 84% coverage.
+
 ## [0.5.0]
 
 ### Added

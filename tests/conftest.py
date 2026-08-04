@@ -31,6 +31,8 @@ ALL_SERVICES = {
     "accesscontrol": "http://cam/onvif/accesscontrol",
     "doorcontrol": "http://cam/onvif/doorcontrol",
     "credential": "http://cam/onvif/credential",
+    "schedule": "http://cam/onvif/schedule",
+    "accessrules": "http://cam/onvif/accessrules",
 }
 
 Responder = Callable[[str], "tuple[int, str]"]

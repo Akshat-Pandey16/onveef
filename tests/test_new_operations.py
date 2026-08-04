@@ -188,7 +188,7 @@ def test_imaging_move_options() -> None:
     )
     options = client.imaging_get_move_options(video_source_token="VS0")
     assert "<timg:VideoSourceToken>VS0</timg:VideoSourceToken>" in sent[0]
-    assert "Continuous" in options
+    assert options["continuous"]["speed"] == {"min": -1.0, "max": 1.0}
 
 
 def test_recording_options() -> None:

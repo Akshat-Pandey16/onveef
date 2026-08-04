@@ -25,7 +25,7 @@ from onveef.exceptions import (
 )
 from onveef.wsdiscovery import DiscoveredDevice
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = (
     "DEFAULT_TIMEOUT_S",

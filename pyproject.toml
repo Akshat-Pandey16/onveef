@@ -1,14 +1,31 @@
 [project]
 name = "onveef"
 dynamic = ["version"]
-description = "A fast, zeep-free ONVIF-compatible SOAP client for IP cameras (Profile S/T/G/M/A/C)."
+description = "A fast, zeep-free ONVIF client library for Python — IP cameras, NVRs and VMS (Profile S/T/G/M/A/C), sync and async."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [{ name = "Akshat Pandey", email = "akshat16pandey@gmail.com" }]
-keywords = ["onvif", "ip-camera", "ptz", "rtsp", "soap", "vms", "cctv", "nvr", "ws-discovery"]
+keywords = [
+    "onvif",
+    "onvif-client",
+    "ip-camera",
+    "security-camera",
+    "ptz",
+    "rtsp",
+    "snapshot",
+    "soap",
+    "vms",
+    "cctv",
+    "nvr",
+    "video-surveillance",
+    "ws-discovery",
+    "profile-s",
+    "profile-t",
+    "profile-g",
+]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3 :: Only",
@@ -51,6 +68,7 @@ onveef = "onveef.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/Akshat-Pandey16/onveef"
+Documentation = "https://github.com/Akshat-Pandey16/onveef#readme"
 Repository = "https://github.com/Akshat-Pandey16/onveef"
 Issues = "https://github.com/Akshat-Pandey16/onveef/issues"
 Changelog = "https://github.com/Akshat-Pandey16/onveef/blob/main/CHANGELOG.md"
@@ -98,7 +116,7 @@ exclude_also = [
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.5.0"
+version = "0.6.0"
 tag_format = "v$version"
 version_scheme = "pep440"
 version_files = ["src/onveef/__init__.py:__version__"]
