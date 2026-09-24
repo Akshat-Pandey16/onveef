@@ -147,7 +147,7 @@ stored anywhere**:
 
 | Workflow | Trigger | Does |
 |---|---|---|
-| `ci.yml` | every push / PR to `main` | ruff + mypy + pytest on Python 3.11–3.13 |
+| `ci.yml` | every push / PR to `main` | ruff + mypy + pytest on Python 3.10–3.13 |
 | `bump.yml` | manual (**Actions → Bump version → Run**) | `cz bump` → updates `__init__.py` + `CHANGELOG.md`, commits, tags `vX.Y.Z`, pushes |
 | `release.yml` | a pushed `vX.Y.Z` tag | build → `twine check` → publish to PyPI → GitHub Release |
 

@@ -6,8 +6,10 @@ import base64
 import hashlib
 import secrets
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape, quoteattr
+
+UTC = timezone.utc  # the object datetime.UTC names on Python 3.11+
 
 WSA_ANONYMOUS = "http://www.w3.org/2005/08/addressing/anonymous"
 
