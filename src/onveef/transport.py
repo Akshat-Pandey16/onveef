@@ -415,7 +415,12 @@ class SyncTransport:
         timeout = (
             self._timeout
             if read_timeout_s is None
-            else httpx.Timeout(self._timeout, read=read_timeout_s)
+            else httpx.Timeout(
+                connect=self._timeout.connect,
+                read=read_timeout_s,
+                write=self._timeout.write,
+                pool=self._timeout.pool,
+            )
         )
         with self._client.stream(
             "POST",
