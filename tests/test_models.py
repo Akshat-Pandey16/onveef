@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from onveef import models, parsers
 
@@ -57,7 +57,7 @@ def test_system_datetime_to_aware_datetime() -> None:
     assert dt.date_time_type == "NTP"
     assert dt.daylight_savings is True
     assert dt.timezone == "CET-1"
-    assert dt.utc == datetime(2026, 7, 2, 10, 30, 0, tzinfo=UTC)
+    assert dt.utc == datetime(2026, 7, 2, 10, 30, 0, tzinfo=timezone.utc)
 
 
 def test_network_interface_from_parser() -> None:

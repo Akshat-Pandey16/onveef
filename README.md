@@ -41,7 +41,7 @@ Runtime dependencies: **`httpx`** and **`defusedxml`**. That's it.
 pip install onveef
 ```
 
-Requires **Python 3.11+**.
+Requires **Python 3.10+**.
 
 ---
 

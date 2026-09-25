@@ -7,7 +7,9 @@ stubbing it out. They are only possible because the clients accept an injected t
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -282,6 +284,70 @@ def test_service_discovery_rewrites_xaddrs_end_to_end() -> None:
     assert urls[-1] == "http://cam/onvif/ptz"
 
 
+_PULLED = "<PullMessagesResponse/>"
+
+
+def _camera_with_clock_off_by(
+    skew_s: float,
+) -> tuple[Callable[[httpx.Request], httpx.Response], list[datetime]]:
+    """A camera whose clock is ``skew_s`` off ours and refuses logins stamped on any other clock."""
+    accepted: list[datetime] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        device_now = datetime.now(timezone.utc) + timedelta(seconds=skew_s)
+        body = request.content.decode()
+        if "GetSystemDateAndTime" in body:
+            return httpx.Response(
+                200,
+                text=(
+                    "<GetSystemDateAndTimeResponse><SystemDateAndTime><UTCDateTime>"
+                    f"<Time><Hour>{device_now.hour}</Hour><Minute>{device_now.minute}</Minute>"
+                    f"<Second>{device_now.second}</Second></Time>"
+                    f"<Date><Year>{device_now.year}</Year><Month>{device_now.month}</Month>"
+                    f"<Day>{device_now.day}</Day></Date>"
+                    "</UTCDateTime></SystemDateAndTime></GetSystemDateAndTimeResponse>"
+                ),
+            )
+        stamp = re.search(r"<wsu:Created>([^<]+)</wsu:Created>", body)
+        assert stamp, "the login carried no WS-Security timestamp"
+        created = datetime.strptime(stamp.group(1), "%Y-%m-%dT%H:%M:%S.000Z").replace(
+            tzinfo=timezone.utc
+        )
+        if abs((created - device_now).total_seconds()) > 5:
+            return httpx.Response(400, text=_fault("Sender not Authorized", "ter:NotAuthorized"))
+        accepted.append(created)
+        return httpx.Response(200, text=_HOSTNAME)
+
+    return handler, accepted
+
+
+@pytest.mark.parametrize("skew_s", [7200.0, -3 * 86400.0])
+def test_a_login_refused_for_clock_skew_is_retried_on_the_device_clock(skew_s: float) -> None:
+    """The client reads the camera's clock after a refused login and re-stamps the retry on it."""
+    handler, accepted = _camera_with_clock_off_by(skew_s)
+    with _client(handler, credentials=OnvifCredentials("admin", "secret")) as client:
+        assert client.get_hostname() == "cam"
+        assert client._clock_offset_s == pytest.approx(skew_s, abs=5)
+    assert len(accepted) == 1
+
+
+def test_a_long_poll_widens_only_the_read_timeout() -> None:
+    """PullMessages is held open by the camera, so that one request gets a longer read timeout."""
+    timeouts: list[dict[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, text=_HOSTNAME if b"GetHostname" in request.content else _PULLED)
+
+    with _client(handler, connect_timeout_s=2.0) as client:
+        client.events_pull_messages(subscription_url="http://cam/onvif/pullpoint", timeout="PT10S")
+        client.get_hostname()
+    assert timeouts == [
+        {"connect": 2.0, "read": 15.0, "write": 5.0, "pool": 5.0},
+        {"connect": 2.0, "read": 5.0, "write": 5.0, "pool": 5.0},
+    ]
+
+
 async def test_async_transport_round_trip() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text=_HOSTNAME)
@@ -325,3 +391,29 @@ async def test_async_oversized_response_is_capped() -> None:
     async with client:
         with pytest.raises(OnvifTransportError, match="cap"):
             await client.get_hostname()
+
+
+async def test_async_login_refused_for_clock_skew_is_retried_on_the_device_clock() -> None:
+    handler, accepted = _camera_with_clock_off_by(7200.0)
+    client = make_async_client(
+        transport=httpx.MockTransport(handler), credentials=OnvifCredentials("admin", "secret")
+    )
+    async with client:
+        assert await client.get_hostname() == "cam"
+        assert client._clock_offset_s == pytest.approx(7200.0, abs=5)
+    assert len(accepted) == 1
+
+
+async def test_async_long_poll_widens_only_the_read_timeout() -> None:
+    timeouts: list[dict[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, text=_PULLED)
+
+    client = make_async_client(transport=httpx.MockTransport(handler), connect_timeout_s=2.0)
+    async with client:
+        await client.events_pull_messages(
+            subscription_url="http://cam/onvif/pullpoint", timeout="PT10S"
+        )
+    assert timeouts == [{"connect": 2.0, "read": 15.0, "write": 5.0, "pool": 5.0}]

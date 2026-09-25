@@ -15,10 +15,10 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from importlib import metadata
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, TypeVar
 
 import httpx
 
@@ -36,6 +36,9 @@ from onveef.exceptions import (
 )
 
 logger = logging.getLogger("onveef")
+
+UTC = timezone.utc  # the object datetime.UTC names on Python 3.11+
+_SyncT = TypeVar("_SyncT", bound="SyncTransport")  # typing.Self is Python 3.11+
 
 
 def _package_version() -> str:
@@ -233,7 +236,7 @@ class SyncTransport:
             proxy=proxy,
         )
 
-    def __enter__(self) -> Self:
+    def __enter__(self: _SyncT) -> _SyncT:
         return self
 
     def __exit__(
@@ -280,7 +283,7 @@ class SyncTransport:
         """The credentials this client authenticates with."""
         return self._credentials
 
-    def connect(self) -> Self:
+    def connect(self: _SyncT) -> _SyncT:
         """Eagerly discover the device's services and return ``self`` for chaining.
 
         Optional — services are discovered lazily on first use anyway — but handy when you
@@ -412,7 +415,12 @@ class SyncTransport:
         timeout = (
             self._timeout
             if read_timeout_s is None
-            else httpx.Timeout(self._timeout, read=read_timeout_s)
+            else httpx.Timeout(
+                connect=self._timeout.connect,
+                read=read_timeout_s,
+                write=self._timeout.write,
+                pool=self._timeout.pool,
+            )
         )
         with self._client.stream(
             "POST",

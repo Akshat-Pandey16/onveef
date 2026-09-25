@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from onveef import envelopes
 
 
@@ -168,3 +170,17 @@ def test_create_pull_point_topic_filter_optional() -> None:
     assert "<tev:Filter>" in filtered
     assert "ConcreteSet" in filtered
     assert "tns1:RuleEngine/CellMotionDetector/Motion" in filtered
+
+
+def test_set_system_date_time_sends_the_utc_instant() -> None:
+    """A zone-aware time reaches the camera as the same instant in UTC, date rollover included."""
+    ist = timezone(timedelta(hours=5, minutes=30))
+    body = envelopes.device_set_system_date_time(
+        date_time_type="Manual",
+        daylight_savings=False,
+        timezone="IST-5:30",
+        utc_datetime=datetime(2026, 1, 1, 3, 4, 5, tzinfo=ist),
+    )
+    assert "<tt:Hour>21</tt:Hour><tt:Minute>34</tt:Minute><tt:Second>5</tt:Second>" in body
+    assert "<tt:Year>2025</tt:Year><tt:Month>12</tt:Month><tt:Day>31</tt:Day>" in body
+    assert "<tt:TZ>IST-5:30</tt:TZ>" in body

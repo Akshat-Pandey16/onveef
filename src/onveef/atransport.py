@@ -12,9 +12,9 @@ import asyncio
 import logging
 import random
 import ssl
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, TypeVar
 
 import httpx
 
@@ -43,6 +43,9 @@ from onveef.transport import (
 )
 
 logger = logging.getLogger("onveef")
+
+UTC = timezone.utc  # the object datetime.UTC names on Python 3.11+
+_AsyncT = TypeVar("_AsyncT", bound="AsyncTransport")  # typing.Self is Python 3.11+
 
 
 class AsyncTransport:
@@ -140,7 +143,7 @@ class AsyncTransport:
             proxy=proxy,
         )
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self: _AsyncT) -> _AsyncT:
         return self
 
     async def __aexit__(
@@ -187,7 +190,7 @@ class AsyncTransport:
         """The credentials this client authenticates with."""
         return self._credentials
 
-    async def connect(self) -> Self:
+    async def connect(self: _AsyncT) -> _AsyncT:
         """Eagerly discover the device's services and return ``self`` for chaining."""
         await self._discover_once()
         return self
@@ -338,7 +341,12 @@ class AsyncTransport:
         timeout = (
             self._timeout
             if read_timeout_s is None
-            else httpx.Timeout(self._timeout, read=read_timeout_s)
+            else httpx.Timeout(
+                connect=self._timeout.connect,
+                read=read_timeout_s,
+                write=self._timeout.write,
+                pool=self._timeout.pool,
+            )
         )
         async with self._client.stream(
             "POST",

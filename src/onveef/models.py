@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from onveef.wsdiscovery import DiscoveredDevice
+
+UTC = timezone.utc  # the object datetime.UTC names on Python 3.11+
 
 __all__ = (
     "DeviceInformation",
