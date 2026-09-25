@@ -37,7 +37,7 @@ jobs:
       # enablement: true here — GITHUB_TOKEN is not allowed to *create* a Pages site,
       # so it fails the job rather than turning Pages on.
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Build site
         run: uv run mkdocs build --strict
