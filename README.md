@@ -68,13 +68,14 @@ Every device operation is reachable without writing code:
 
 ```bash
 onveef discover                                    # WS-Discovery sweep of every interface
+onveef locate 192.168.1.64                         # find the ONVIF URL when WS-Discovery is off
 onveef info 192.168.1.64 -u admin -p secret        # manufacturer / model / firmware
 onveef profiles 192.168.1.64 -u admin -p secret --json
 onveef stream-uri 192.168.1.64 -u admin -p secret --with-credentials
 onveef snapshot 192.168.1.64 -u admin -p secret -o frame.jpg
 onveef events 192.168.1.64 -u admin -p secret --topic 'tns1:RuleEngine//.' --count 5
 onveef raw 192.168.1.64 --operation GetHostname --builder device_get_hostname
-onveef dump 192.168.1.64 -u admin -p secret -d fixtures/mycam   # capture test fixtures
+onveef dump 192.168.1.64 -u admin -p secret -d fixtures/mycam   # capture scrubbed test fixtures
 ```
 
 `python -m onveef` works too. Add `--json` to any command for machine-readable output.
@@ -175,6 +176,53 @@ wsdiscovery.local_ipv4_addresses()                       # what would be probed
 `wsdiscovery.build_probe()` / `wsdiscovery.parse_probe_matches()` are exposed
 separately so you can drive the multicast yourself or unit-test against captures.
 
+Some cameras do not answer WS-Discovery at all, and their ONVIF port is anyone's guess
+(8000 on Reolink, 2020 on Tapo, 8899 on many OEM boards). `find_device_service()` tries the
+common ports and paths with an unauthenticated `GetSystemDateAndTime` — no credentials leave
+your machine — and returns the URL that answered:
+
+```python
+url = wsdiscovery.find_device_service("192.168.1.64")   # or `onveef locate 192.168.1.64`
+cam = OnvifClient(url, username="admin", password="secret")
+```
+
+### Changing settings without resetting the rest
+
+ONVIF `Set*Configuration` operations replace a configuration as a whole: to change the bit
+rate you must send the resolution, frame rate, GOP, profile, rate-control mode and multicast
+setup back exactly as they were, or the camera resets them. The `update_*` helpers read the
+configuration, overlay your change, check it against the camera's own options and write it
+back — over Media2 when the camera has it, falling back to Media1 (except for H.265, which
+Media1 cannot express):
+
+```python
+from onveef import OnvifValidationError
+
+cam.update_video_encoder_configuration(configuration_token="VE0", bitrate_kbps=2048)
+try:
+    cam.update_video_encoder_configuration(configuration_token="VE0", frame_rate=27.5)
+except OnvifValidationError as exc:
+    print(exc.errors)   # {'frame_rate': ['27.5 fps is not offered; choose one of 1, 2, …, 25.']}
+
+cam.get_video_encoder_options_merged(configuration_token="VE0")  # what the encoder accepts
+```
+
+Imaging works the same way. The schema makes each block's mode mandatory, so
+`imaging_update_settings()` fills it in from the current settings — changing one exposure
+limit no longer needs you to know the exposure mode:
+
+```python
+cam.imaging_update_settings(video_source_token="VS0", exposure_max_time=33333, brightness=55)
+cam.imaging_get_options_normalized(video_source_token="VS0")   # ranges and modes on offer
+```
+
+The plain setters keep what they are not told, too: `set_video_encoder_configuration`,
+`set_audio_encoder_configuration` and `set_metadata_configuration` read back the multicast
+setup, session timeout and (for metadata) the event filter instead of resetting them, and
+`set_video_source_rotation()` rotates the picture without touching its crop.
+`change_password(new_password=...)` changes an account's password under its existing user
+level — and, for the client's own account, keeps the client signed in.
+
 ### PTZ
 
 ```python
@@ -203,6 +251,21 @@ client.ptz_operate_preset_tour(profile_token=token, preset_tour_token=tour, oper
 
 On cameras that report a geo-location, `ptz_geo_move(profile_token=..., lat=..., lon=...)`
 aims at a coordinate rather than a pan/tilt position.
+
+Click-to-center moves the camera so that a point on the picture becomes its centre. Give the
+point as fractions of the image (0..1 from the left and from the top); the camera moves in its
+`TranslationSpaceFov`:
+
+```python
+caps = client.ptz_capabilities(profile_token=token)
+if caps["click_to_center"]:
+    client.ptz_center(profile_token=token, x=0.8, y=0.3, pan_tilt_space=caps["fov_space"])
+```
+
+`ptz_capabilities()` condenses the profile's PTZ node and lens into booleans and ranges —
+continuous/relative/absolute axes, presets, preset tours, home, focus and iris control, speed
+ranges — for gating a control panel. Every move also takes `pan_tilt_space=`/`zoom_space=`,
+to address a node's other coordinate spaces (degrees, FOV) instead of the default.
 
 ### Events: pull-point *and* push
 
@@ -267,6 +330,11 @@ msgs = client.events_pull_messages(subscription_url=sub["subscription_url"])
 client.events_renew(subscription_url=sub["subscription_url"])
 ```
 
+Devices often grant a shorter lifetime than the one asked for. `lifetime_s` in the create and
+renew results is what was actually granted (measured on the device's own clock), and
+`pull_point()` schedules from it: it renews at half the granted lifetime and keeps each long
+poll within a third of it, so the subscription cannot lapse mid-poll.
+
 ### Two-way audio (backchannel)
 
 Profile T's talk-down path needs a decoder configuration on the profile. Discover what the
@@ -292,6 +360,22 @@ for attrs in client.get_media_attributes(recording_tokens=[recording]):
     print(attrs["from"], attrs["until"], attrs["tracks"])   # what a timeline can seek within
 print(client.get_replay_uri(recording_token=recording))
 ```
+
+Playing a recording back is RTSP with ONVIF extensions. `onveef.replay` supplies the ONVIF
+part for whichever RTSP client you use: the headers that turn a `PLAY` into a replay of a
+time range, and the RTP header extension that stamps each frame with when it was captured:
+
+```python
+from onveef import replay
+
+headers = replay.replay_headers(start, end)   # Require: onvif-replay, Range: clock=…, Rate-Control: no
+mark = replay.parse_replay_extension(rtp_packet)
+if mark is not None:
+    print(mark.time, mark.clean_point, mark.end_of_section)
+```
+
+Search-result calls (`get_recording_search_results` and friends) widen their read timeout
+to their `wait_time`, since a camera may legitimately hold the request that long.
 
 ### Physical Access Control (Profile A/C)
 
@@ -331,15 +415,34 @@ if client.endpoint.has("deviceio"):
 
 `onveef` implements **WS-Security `UsernameToken` PasswordDigest** by default and
 automatically re-signs with a device-derived clock offset when a request is rejected
-for time skew (a common cause of `401`s on cameras with wrong clocks). Options:
+for time skew (a common cause of `401`s on cameras with wrong clocks). The device's clock is
+read with an *unauthenticated* `GetSystemDateAndTime`, since a strict camera refuses a
+clock read stamped with the very clock being corrected, and a refusal is recognised however
+the camera words it (`ter:NotAuthorized`, `wsse:FailedAuthentication`,
+`wsse:InvalidSecurity`, HTTP 400 or 401). A long-lived client re-measures the clock at most
+once a minute, so it follows a camera whose clock jumps after an NTP sync, and only retries a
+refused login when the offset actually moved — wrong credentials are not retried.
+
+Read the measured offset from `client.clock_offset_s` (or receive it through
+`on_clock_resync=`) and pass it to the next client for the same device, which then signs on
+the right clock from its first request:
+
+```python
+cam = OnvifClient(host, 80, user, password, clock_offset_s=saved_offset,
+                  on_clock_resync=lambda offset: store(device_id, offset))
+```
+
+Options:
 
 | Constructor arg | Default | Meaning |
 |---|---|---|
 | `verify_tls` | `True` | TLS verification. Accepts `False`, a CA-bundle path, or an `ssl.SSLContext` — prefer pinning a self-signed cert over disabling verification. |
 | `rewrite_host` | `True` | Re-point every address the device reports about itself at the host you connected to. Turn off to trust the device verbatim. |
-| `http_auth` | `"auto"` | HTTP transport auth to try when a device answers `401` with a `WWW-Authenticate` challenge — `"auto"` (Digest→Basic), `"digest"`, `"basic"`, or `"none"`. Works **alongside** WS-Security, for cameras that require HTTP Digest on the SOAP endpoint. |
+| `http_auth` | `"auto"` | HTTP transport auth to try when a device answers `401` with a `WWW-Authenticate` challenge — `"auto"` (Digest→Basic), `"digest"`, `"basic"`, or `"none"`. Works **alongside** WS-Security, for cameras that require HTTP Digest on the SOAP endpoint. Once a device has asked, later requests answer it up front (reusing the Digest challenge), instead of collecting a `401` each time. |
 | `password_text` | `False` | Force WS-Security `PasswordText` (plaintext) instead of digest. |
-| `password_text_fallback` | `False` | On digest `401`, retry once with `PasswordText`. Some cheap firmware only accepts plaintext, but this sends **the password in the clear** on non-HTTPS transports, so you must opt in per device. |
+| `password_text_fallback` | `False` | On a refused digest login, retry with `PasswordText` — and keep using it for that client once it works, rather than handing the device a failed login on every call. Some cheap firmware only accepts plaintext, but this sends **the password in the clear** on non-HTTPS transports, so you must opt in per device. |
+| `clock_offset_s` | `0.0` | Seconds the device clock is ahead of this host's, e.g. a `clock_offset_s` saved from an earlier client — saves the refused login it takes to measure it. |
+| `on_clock_resync` | `None` | Called with the new offset whenever the client re-measures the device clock. |
 | `ws_timestamp` | `False` | Add a `<wsu:Timestamp>`/`Expires` to the security header (required by some strict devices). |
 | `retries` | `2` | Automatic retries (jittered backoff) for transient failures on idempotent (read) operations only. |
 | `breaker_key` | `None` | Enable a per-client circuit breaker keyed by this id (e.g. device id). Omit to disable. Tune with `breaker_window_s` / `breaker_threshold` / `breaker_open_s`. |
@@ -358,17 +461,17 @@ retries, auth fallbacks, clock resync, and breaker events.
 
 | Service | Coverage | Notes |
 |---|---|---|
-| Device Management | ✅ full | info, services/capabilities discovery, datetime (+clock-skew), hostname, users, scopes, network, DNS/NTP, log, certs, dot1x, storage, zero-config, endpoint reference, geo-location, firmware upgrade & system restore |
-| Media (Profile S) | ✅ full | profiles (incl. single `GetProfile`), stream/snapshot URI, video **and audio** encoder/source configurations — get, options **and** set — video source **modes**, compatible configurations, encoder-instance guarantees, analytics-configuration attach, OSD, metadata, multicast |
+| Device Management | ✅ full | info, services/capabilities discovery, datetime (+clock-skew), hostname, users (+ `change_password`), scopes, network, DNS/NTP, log, certs, dot1x, storage, zero-config, endpoint reference, geo-location, firmware upgrade & system restore |
+| Media (Profile S) | ✅ full | profiles (incl. single `GetProfile`), stream/snapshot URI, video **and audio** encoder/source configurations — get, options **and** set, with read-modify-write `update_video_encoder_configuration` validated against the options — video source **modes** and rotation, compatible configurations, encoder-instance guarantees, analytics-configuration attach, OSD, metadata (+ event filter), multicast |
 | Media2 (Profile T) | ✅ strong | profiles + create/delete, `AddConfiguration`/`RemoveConfiguration`, encoder options, audio decoder (backchannel) configurations, privacy masks (get/delete — create/modify pending), sync point |
-| PTZ | ✅ full | continuous/absolute/relative, presets, home, aux, nodes, status, configurations + options, preset tours (full CRUD + options), `GeoMove` |
-| Imaging | ✅ strong | settings/options/status, focus move/stop + move options, imaging presets |
-| Events | ✅ full | pull-point (managed, +topic filter, sync point) **and** WS-BaseNotification push — `Subscribe`, renew, unsubscribe, and `parse_notification()` for the `Notify` your consumer receives |
+| PTZ | ✅ full | continuous/absolute/relative (in any advertised coordinate space), click-to-center (`ptz_center`), `ptz_capabilities`, presets, home, aux, nodes, status, configurations + options, preset tours (full CRUD + options), `GeoMove` |
+| Imaging | ✅ full | settings (incl. image stabilization, IR-cut auto adjustment, tone compensation, defogging, noise reduction) / normalized options / status, read-modify-write `imaging_update_settings`, focus move/stop + move options, imaging presets |
+| Events | ✅ full | pull-point (managed, +topic filter, sync point, scheduled from the granted lifetime) **and** WS-BaseNotification push — `Subscribe`, renew, unsubscribe, and `parse_notification()` for the `Notify` your consumer receives |
 | Analytics | ✅ strong | rules & modules CRUD (SimpleItem + ElementItem params), supported-rule/module **descriptions**, configuration attach/detach/set |
-| Recording / Replay / Search (Profile G) | ✅ strong | recordings/jobs CRUD, job **state**, track CRUD + configuration, recording options, `GetMediaAttributes`, replay URI/config, find sessions + search state |
+| Recording / Replay / Search (Profile G) | ✅ strong | recordings/jobs CRUD, job **state**, track CRUD + configuration, recording options, `GetMediaAttributes`, replay URI/config, RTSP replay headers + RTP replay-extension decoding (`onveef.replay`), find sessions + search state |
 | DeviceIO | ✅ strong | relays (DeviceIO-aware), relay output options, digital inputs, serial ports |
 | Access Control / Door / Credential (Profile A/C) | ✅ strong | access points, areas, doors (+lock/unlock/block/lockdown), credentials **incl. create/modify**, schedules and special-day groups, access profiles |
-| WS-Discovery | ✅ full | multi-interface multicast Probe with retransmits, unicast probe, optional IPv6, ProbeMatch parsing |
+| WS-Discovery | ✅ full | multi-interface multicast Probe with retransmits, unicast probe, optional IPv6, ProbeMatch parsing, HTTP fallback `find_device_service` for devices that ignore WS-Discovery |
 | Network | ✅ full | interfaces (IPv4 **and** IPv6), protocols, gateway, DNS, NTP |
 
 Not covered yet: Media2 mask create/modify, receivers, and the authentication-behavior /
@@ -393,6 +496,11 @@ release.
   when advertised, falling back to the legacy device service.
 - **Pluggable resilience.** Optional in-memory circuit breaker; bounded (8 MiB)
   streamed responses; content-type negotiation (`application/soap+xml` → `text/xml`).
+- **Writes keep what they do not change.** A `Set*Configuration` replaces the whole
+  configuration, so every setter echoes back what it was not asked to change (multicast,
+  session timeout, rate-control mode, event filter, crop bounds) and the `update_*` helpers
+  merge a partial change into what the device reports — validated against its own options
+  before anything is sent (`onveef.updates`).
 - **Nothing the device says about its address is trusted.** Reported XAddrs, subscription
   references and media URIs are re-pointed at the host you reached the device on
   (`onveef.urls`), which is what makes NAT, port forwards and Docker bridges work.

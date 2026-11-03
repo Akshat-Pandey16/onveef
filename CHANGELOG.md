@@ -4,6 +4,105 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/) (0.x while the API stabilises).
 
+## [0.7.0]
+
+### Fixed
+- **`events_pull_messages()` and `pull_point()` crashed on every poll** with a bare
+  `AssertionError` from httpx: the long-poll read timeout was built as
+  `httpx.Timeout(timeout, read=…)`, which httpx does not accept. (#17)
+- **Media2 `SetVideoEncoderConfiguration` now follows `tt:VideoEncoder2Configuration`.**
+  It sent `Encoding` and the `FrameRateLimit`/`BitrateLimit` rate limits as attributes and
+  `Quality` before `RateControl`; strict devices rejected the request and lenient ones
+  ignored the values, so the write silently changed nothing. It also hardcoded
+  `ConstantBitRate="false"`, turning any CBR stream it touched into VBR. `Encoding`,
+  `Resolution`, `RateControl` (limits as children, `ConstantBitRate` as its attribute),
+  `Multicast` and `Quality` are now elements in schema order, with `GovLength`, `Profile`
+  and `GuaranteedFrameRate` as attributes; the rate mode is only sent when asked for.
+- **Writes no longer reset the multicast setup.** `set_video_encoder_configuration`,
+  `set_audio_encoder_configuration` and `set_metadata_configuration` hardcoded multicast
+  `0.0.0.0` port 0 (and a 60 s session timeout) into every write. They now read the
+  device's current values back and keep them unless told otherwise; the metadata setter also
+  keeps the `Events` filter, without which the metadata stream silently stopped carrying
+  events.
+- **`SetVideoSourceConfiguration` sends `UseCount` as the element the schema requires**,
+  not as an attribute, and `set_video_source_configuration` keeps the current crop bounds
+  when no size is given instead of writing a `0x0` crop.
+- **Clock-skew recovery reads the device clock unauthenticated.** `GetSystemDateAndTime`
+  carried the very WS-Security stamp the device was refusing, so a camera that checks it
+  (CP Plus, Dahua OEM units) refused the clock read too and recovery never happened.
+- **A refused login is recognised however the camera words it.** Only reasons containing
+  `NotAuthorized` or `Sender not Authorized` counted; `wsse:FailedAuthentication`,
+  `wsse:InvalidSecurity` and "…the sender is not authorized" (with HTTP 400 or 500)
+  surfaced as `OnvifFaultError`, skipping clock-skew recovery and the plaintext fallback.
+  `parsers.fault_is_auth()` now inspects the whole fault.
+- **Clock-skew recovery is no longer once per client.** A long-lived client re-measures the
+  device clock at most once a minute after a refused login (a camera's clock jumps when NTP
+  catches up after a reboot), and only retries when the offset actually moved — wrong
+  credentials are no longer retried just because the offset was not exactly zero.
+- **Pull-point subscriptions are scheduled from the lifetime the device granted.** They
+  renewed at half the *requested* lifetime, so a device that caps lifetimes let the
+  subscription lapse — and drop events — before every renewal. Renewals now follow the
+  granted lifetime (`lifetime_s`, measured on the device's clock) and each long poll stays
+  within a third of it.
+- **`Get*SearchResults` widen their read timeout to their `WaitTime`.** With the defaults
+  (`PT5S` against a 5 s read timeout) a device that waited the full time raced the timeout,
+  and any longer `wait_time` always timed out. Long polls also never shorten a longer
+  configured read timeout.
+- **PTZ nodes list every coordinate space**, not just the first of each kind — which hid
+  `TranslationSpaceFov` behind the generic relative space — plus the speed spaces,
+  `SpaceURI` spellings, preset-tour support, `GeoMove` and auxiliary commands.
+
+### Added
+- **Python 3.10 support** (`requires-python` was `>=3.11`). (#17)
+- **Read-modify-write settings.** `update_video_encoder_configuration()` changes some
+  encoder settings and keeps the rest, validating the change against the encoder's options
+  (`get_video_encoder_options_merged()` unions Media2, per-profile and Media1 answers) and
+  writing over Media2 with a Media1 fallback (never for H.265). `imaging_update_settings()`
+  fills in the mode each changed imaging block requires and validates against the new
+  `imaging_get_options_normalized()`. Invalid values raise `OnvifValidationError`, whose
+  `errors` name each field. The merging and checking live in the sans-IO `onveef.updates`.
+- **Full imaging settings**: `MinIris`/`MaxIris`/`ExposureTime`/`Gain`, focus speed and
+  limits, and the extensions — image stabilization, IR-cut filter auto adjustment, tone
+  compensation, defogging and noise reduction — in both `imaging_set_settings` and
+  `parse_imaging_settings`.
+- **PTZ**: `pan_tilt_space=`/`zoom_space=` on every move, `ptz_center()` (click-to-center
+  in `TranslationSpaceFov`), `ptz_capabilities()`, and the pure `onveef.ptz` helpers behind
+  them.
+- **Clock offset persistence**: the `clock_offset_s=` constructor argument and property and
+  the `on_clock_resync=` callback, so a new client signs on the right clock from its first
+  request.
+- **`change_password()`**, keeping the account's user level and the client signed in.
+- **`set_video_source_rotation()`**, and rotation degrees/reboot flag in
+  `parse_video_source_configuration_options`.
+- **Encoder details a write must echo back**: `frame_rate`, `constant_bitrate`,
+  `guaranteed_frame_rate`, `average_bitrate_kbps`, `multicast` and a codec-agnostic
+  `profile` (MPEG-4 included) in the configuration parsers; discrete `frame_rates`,
+  `encoding_interval` and CBR/guaranteed-frame-rate/average-bit-rate support flags in the
+  normalized options; `audio_source` in parsed profiles; `session_timeout` and `multicast`
+  in audio encoder and metadata configurations.
+- **`onveef.replay`**: the ONVIF replay `PLAY` headers and the RTP replay-extension decoder
+  (`parse_replay_extension`) for playing Profile G recordings back with any RTSP client.
+- **`wsdiscovery.find_device_service()`** (and `onveef locate`) finds the device-service
+  URL of a camera that does not answer WS-Discovery by trying the common ports and paths.
+- **`events_renew()` returns the renewal's times** and granted `lifetime_s`;
+  `parsers.parse_renew()`.
+- A real CP Plus (Dahua OEM) capture in `tests/fixtures/cpplus`, covering Media1 and
+  Media2, encoder and imaging options.
+
+### Changed
+- `onveef dump` now scrubs serial numbers, hardware IDs, MAC and IP addresses and
+  name/location scopes (`--no-scrub` keeps them), captures the per-configuration option
+  sets and Media2 replies, writes a `camera.json`, and stops at the first refused login so
+  as not to lock the account.
+- `password_text_fallback` sticks once the device accepts `PasswordText`, instead of
+  sending a failed digest login before every call.
+- Once a device has answered with an HTTP auth challenge, later requests answer it up front
+  (reusing the Digest challenge), instead of collecting a `401` each time.
+- `parse_audio_encoder_configuration_options` lists rates sorted and de-duplicated, and
+  accepts space-separated `Items`.
+- Each configuration from `get_video_encoder_configurations()` carries the `service` it was
+  read from.
+
 ## [0.6.0]
 
 ### Added

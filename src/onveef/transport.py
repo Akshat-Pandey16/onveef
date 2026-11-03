@@ -14,6 +14,7 @@ import re
 import ssl
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import metadata
@@ -60,6 +61,44 @@ _CONTENT_TYPES = (
 )
 _NOAUTH_OPERATIONS = frozenset({"GetSystemDateAndTime", "GetCapabilities", "GetServices"})
 _ISO8601_DURATION = re.compile(r"^-?P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$")
+_CLOCK_RESYNC_MIN_S = 2.0
+"""A re-measured device clock that moved less than this does not justify a second login."""
+_CLOCK_RESYNC_INTERVAL_S = 60.0
+"""How often a long-lived client may re-measure the device clock after a refused login."""
+_LONG_POLL_GRACE_S = 5.0
+"""Read-timeout headroom over the time a device may legitimately hold a long poll."""
+ClockResyncCallback = Callable[[float], None]
+
+
+def _device_utc(info: dict[str, Any]) -> datetime | None:
+    """The device's UTC clock from a :func:`~onveef.parsers.parse_system_datetime` dict."""
+    utc = info.get("UTCDateTime")
+    if not isinstance(utc, dict):
+        return None
+    try:
+        return datetime(
+            utc["year"],
+            utc["month"],
+            utc["day"],
+            utc["hour"],
+            utc["minute"],
+            utc["second"],
+            tzinfo=UTC,
+        )
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def _fault_error(operation: str, xml: str) -> OnvifError:
+    """Classify a SOAP fault: rejected credentials, an unimplemented operation, or other."""
+    fault = parsers.parse_fault(xml)
+    if parsers.fault_is_auth(xml):
+        return OnvifAuthError(f"ONVIF call '{operation}' denied: {fault}")
+    if parsers.fault_is_unsupported(fault):
+        return OnvifOperationNotSupportedError(
+            f"ONVIF call '{operation}' is not supported by this device."
+        )
+    return OnvifFaultError(f"ONVIF call '{operation}' fault: {fault}")
 
 
 def _iso8601_seconds(value: str, default: float) -> float:
@@ -180,6 +219,8 @@ class SyncTransport:
         transport: httpx.BaseTransport | None = None,
         proxy: str | None = None,
         http_client: httpx.Client | None = None,
+        clock_offset_s: float = 0.0,
+        on_clock_resync: ClockResyncCallback | None = None,
     ) -> None:
         if endpoint is None:
             if not host:
@@ -221,9 +262,11 @@ class SyncTransport:
         self._auto_discover = auto_discover
         self._rewrite_host = rewrite_host
         self._discovered = False
-        self._clock_offset_s = 0.0
-        self._clock_synced = False
+        self._clock_offset_s = float(clock_offset_s)
+        self._on_clock_resync = on_clock_resync
+        self._clock_checked_at = float("-inf")
         self._clock_syncing = False
+        self._sticky_http_auth: httpx.Auth | None = None
         self._discover_lock = threading.RLock()
         self._clock_lock = threading.RLock()
         self._owns_client = http_client is None
@@ -283,6 +326,18 @@ class SyncTransport:
         """The credentials this client authenticates with."""
         return self._credentials
 
+    @property
+    def clock_offset_s(self) -> float:
+        """Seconds the device's clock is ahead of this host's (negative when behind).
+
+        Measured with an unauthenticated ``GetSystemDateAndTime`` after the device refuses a
+        login, and used to stamp every WS-Security header after that. Keep it (or receive
+        it through ``on_clock_resync``) and pass it as ``clock_offset_s=`` to the next
+        client for the same device, so that client signs on the right clock from its first
+        request instead of failing a login to find out.
+        """
+        return self._clock_offset_s
+
     def connect(self: _SyncT) -> _SyncT:
         """Eagerly discover the device's services and return ``self`` for chaining.
 
@@ -328,11 +383,17 @@ class SyncTransport:
         return urls.rewrite_service_map(services, self._endpoint.device_xaddr)
 
     def get_system_date_time(self) -> dict[str, Any]:
-        """Return the ONVIF ``GetSystemDateAndTime`` result from the Device service, parsed by ``parsers.parse_system_datetime`` into ``dict[str, Any]``."""
+        """Return the ONVIF ``GetSystemDateAndTime`` result from the Device service, parsed by ``parsers.parse_system_datetime`` into ``dict[str, Any]``.
+
+        Sent without WS-Security first (it is a pre-authentication operation): this is the
+        call that measures clock skew, and a device that checks the header's timestamp
+        would refuse a request stamped on the very clock being corrected.
+        """
         xml = self.call(
             service="device",
             operation="GetSystemDateAndTime",
             body_inner=envelopes.device_get_system_date_time(),
+            require_auth=False,
         )
         return parsers.parse_system_datetime(xml)
 
@@ -452,14 +513,15 @@ class SyncTransport:
         content_type: str,
         read_timeout_s: float | None = None,
     ) -> tuple[int, str]:
+        auth = self._sticky_http_auth
         status, text, challenge = self._raw_post(
             url=url,
             content_type=content_type,
             envelope=envelope,
-            auth=None,
+            auth=auth,
             read_timeout_s=read_timeout_s,
         )
-        if status == 401:
+        if status == 401 and auth is None:
             auth = self._http_auth_for(challenge)
             if auth is not None:
                 status, text, _ = self._raw_post(
@@ -469,6 +531,11 @@ class SyncTransport:
                     auth=auth,
                     read_timeout_s=read_timeout_s,
                 )
+                if status != 401:
+                    # The device wants HTTP auth: answer it up front from now on rather than
+                    # collecting a 401 per request. Reusing one DigestAuth also keeps its
+                    # challenge, so later requests go out already signed.
+                    self._sticky_http_auth = auth
         return status, text
 
     def _backoff(self, attempt: int) -> float:
@@ -520,14 +587,7 @@ class SyncTransport:
                     f"ONVIF call '{operation}' returned HTTP {status}.", retryable=True
                 )
             if parsers.has_soap_fault(text):
-                fault = parsers.parse_fault(text)
-                if "NotAuthorized" in fault or "Sender not Authorized" in fault:
-                    raise OnvifAuthError(f"ONVIF call '{operation}' denied: {fault}")
-                if parsers.fault_is_unsupported(fault):
-                    raise OnvifOperationNotSupportedError(
-                        f"ONVIF call '{operation}' is not supported by this device."
-                    )
-                raise OnvifFaultError(f"ONVIF call '{operation}' fault: {fault}")
+                raise _fault_error(operation, text)
             self._record_success()
             return text
         self._record_failure()
@@ -614,13 +674,7 @@ class SyncTransport:
                 override never leaks into other requests sharing this client.
         """
         xaddr = self.require(service)
-        wants_auth = self._credentials.configured
-        if require_auth is False:
-            wants_auth = False
-        elif require_auth is True:
-            wants_auth = True
-        elif operation in _NOAUTH_OPERATIONS:
-            wants_auth = self._credentials.configured
+        wants_auth = self._credentials.configured if require_auth is None else require_auth
         if not wants_auth:
             try:
                 return self._call_raw(
@@ -633,83 +687,107 @@ class SyncTransport:
             except OnvifAuthError:
                 if not self._credentials.configured:
                     raise
-        try:
-            return self._call_raw(
+        return self._with_auth_recovery(
+            lambda password_text: self._call_raw(
                 xaddr=xaddr,
                 operation=operation,
                 body_inner=body_inner,
                 with_auth=True,
+                password_text=password_text,
                 read_timeout_s=read_timeout_s,
-            )
+            ),
+            operation=operation,
+            url=xaddr,
+        )
+
+    def _with_auth_recovery(
+        self, send: Callable[[bool | None], str], *, operation: str, url: str
+    ) -> str:
+        """Run an authenticated ``send`` and recover from the logins devices wrongly refuse.
+
+        ``send(password_text)`` builds and posts the request (``None`` meaning "the client's
+        current password mode"). On a refusal the device clock is re-measured and the
+        request re-signed on it if that moved the offset; then, only when opted in with
+        ``password_text_fallback``, the password is retried as ``PasswordText`` — and kept
+        that way for this client once it works, so the device is not handed a failed digest
+        login (which counts towards account lockout) on every later call.
+        """
+        used_offset, used_text = self._clock_offset_s, self._password_text
+        try:
+            return send(None)
         except OnvifAuthError:
             if not self._credentials.configured:
                 raise
-            if not self._clock_synced:
-                self._sync_clock_offset()
-                if self._clock_offset_s != 0.0:
-                    try:
-                        return self._call_raw(
-                            xaddr=xaddr,
-                            operation=operation,
-                            body_inner=body_inner,
-                            with_auth=True,
-                            read_timeout_s=read_timeout_s,
-                        )
-                    except OnvifAuthError:
-                        pass
-            if self._password_text_fallback and not self._password_text:
-                logger.warning(
-                    "onveef: digest auth failed for '%s'; retrying with plaintext PasswordText%s",
-                    operation,
-                    " over an unencrypted http:// connection"
-                    if xaddr.startswith("http://")
-                    else "",
-                )
-                return self._call_raw(
-                    xaddr=xaddr,
-                    operation=operation,
-                    body_inner=body_inner,
-                    with_auth=True,
-                    password_text=True,
-                    read_timeout_s=read_timeout_s,
-                )
-            raise
+            # Re-sign when the clock moved, or when another call (possibly the clock read
+            # itself) switched this client to PasswordText since this request was signed.
+            if self._resync_clock(used_offset) or self._password_text != used_text:
+                try:
+                    return send(None)
+                except OnvifAuthError:
+                    pass
+            if self._password_text or not self._password_text_fallback:
+                raise
+        logger.warning(
+            "onveef: digest auth failed for '%s'; retrying with plaintext PasswordText%s",
+            operation,
+            " over an unencrypted http:// connection" if url.startswith("http://") else "",
+        )
+        result = send(True)
+        if not self._password_text:
+            self._password_text = True
+            logger.warning(
+                "onveef: %s accepted PasswordText; this client uses it from now on",
+                self._endpoint.device_xaddr,
+            )
+        return result
 
-    def _sync_clock_offset(self) -> None:
-        if self._clock_synced or self._clock_syncing:
-            return
+    def _resync_clock(self, used_offset: float) -> bool:
+        """Re-measure the device clock after a refused login; ``True`` when a retry is worth it.
+
+        A retry is worth it when the offset now differs by at least
+        :data:`_CLOCK_RESYNC_MIN_S` from ``used_offset``, the one the refused request was
+        signed with — whether this call measured it or a concurrent call already had. The
+        clock is read at most once per :data:`_CLOCK_RESYNC_INTERVAL_S`: often enough for a
+        long-lived client to follow a device whose clock jumps (an NTP correction after a
+        reboot), rarely enough that wrong credentials cost one extra unauthenticated request
+        a minute instead of one per call.
+        """
         with self._clock_lock:
-            if self._clock_synced or self._clock_syncing:
-                return
+            if abs(self._clock_offset_s - used_offset) >= _CLOCK_RESYNC_MIN_S:
+                return True
+            now = time.monotonic()
+            if self._clock_syncing or now - self._clock_checked_at < _CLOCK_RESYNC_INTERVAL_S:
+                return False
             self._clock_syncing = True
+            self._clock_checked_at = now
             try:
-                info = self.get_system_date_time()
-            except (
-                OnvifAuthError,
-                OnvifFaultError,
-                OnvifTransportError,
-                OnvifCapabilityMissingError,
-            ):
-                return
+                device_utc = _device_utc(self.get_system_date_time())
+            except OnvifError:
+                return False
             finally:
                 self._clock_syncing = False
-            utc = info.get("UTCDateTime")
-            if not isinstance(utc, dict):
-                return
-            try:
-                device_utc = datetime(
-                    utc["year"],
-                    utc["month"],
-                    utc["day"],
-                    utc["hour"],
-                    utc["minute"],
-                    utc["second"],
-                    tzinfo=UTC,
-                )
-            except (KeyError, ValueError, TypeError):
-                return
-            self._clock_offset_s = (device_utc - datetime.now(UTC)).total_seconds()
-            self._clock_synced = True
+            if device_utc is None:
+                return False
+            offset = (device_utc - datetime.now(UTC)).total_seconds()
+            self._clock_offset_s = offset
+        logger.debug("onveef: %s clock offset is %.1fs", self._endpoint.device_xaddr, offset)
+        if self._on_clock_resync is not None:
+            self._on_clock_resync(offset)
+        return abs(offset - used_offset) >= _CLOCK_RESYNC_MIN_S
+
+    def _use_password(self, password: str) -> None:
+        """Authenticate with ``password`` from now on (after changing it on the device).
+
+        Replaces the credentials object rather than mutating it, since it may be the
+        caller's, and drops the cached HTTP auth, which still holds the old password.
+        """
+        self._credentials = OnvifCredentials(self._credentials.username, password)
+        self._sticky_http_auth = None
+
+    def _long_poll_timeout(self, held_s: float) -> float:
+        """The read timeout for a request the device may legitimately hold for ``held_s``."""
+        read = self._timeout.read
+        return max(read if read is not None else 0.0, held_s + _LONG_POLL_GRACE_S)
 
     def _media_service(self) -> tuple[str, bool]:
         if self._has("media"):
@@ -732,37 +810,25 @@ class SyncTransport:
         operation: str,
         read_timeout_s: float | None = None,
     ) -> str:
-        def build() -> str:
-            return envelopes.build_envelope(
+        def send(password_text: bool | None) -> str:
+            envelope = envelopes.build_envelope(
                 body,
                 username=self._credentials.username,
                 password=self._credentials.password,
                 wsa_action=wsa_action,
                 wsa_to=subscription_url,
                 clock_offset_s=self._clock_offset_s,
-                use_password_text=self._password_text,
+                use_password_text=self._password_text if password_text is None else password_text,
                 add_timestamp=self._ws_timestamp,
             )
+            return self._post_xml(
+                url=subscription_url,
+                envelope=envelope,
+                operation=operation,
+                read_timeout_s=read_timeout_s,
+            )
 
-        try:
-            return self._post_xml(
-                url=subscription_url,
-                envelope=build(),
-                operation=operation,
-                read_timeout_s=read_timeout_s,
-            )
-        except OnvifAuthError:
-            if self._clock_synced or not self._credentials.configured:
-                raise
-            self._sync_clock_offset()
-            if self._clock_offset_s == 0.0:
-                raise
-            return self._post_xml(
-                url=subscription_url,
-                envelope=build(),
-                operation=operation,
-                read_timeout_s=read_timeout_s,
-            )
+        return self._with_auth_recovery(send, operation=operation, url=subscription_url)
 
     def _post_xml(
         self, *, url: str, envelope: str, operation: str, read_timeout_s: float | None = None

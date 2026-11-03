@@ -118,7 +118,7 @@ exclude_also = [
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.6.0"
+version = "0.7.0"
 tag_format = "v$version"
 version_scheme = "pep440"
 version_files = ["src/onveef/__init__.py:__version__"]

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import socket
+from collections.abc import Callable
 from typing import Any
 
+import httpx
 import pytest
 
 from onveef import wsdiscovery
@@ -205,3 +207,71 @@ async def test_discover_async_retransmits(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(wsdiscovery, "local_ipv4_addresses", lambda: ["10.0.0.2"])
     await wsdiscovery.discover_async(timeout_s=0.06, probes=3)
     assert len(sent) == 3
+
+
+def test_candidate_urls_try_the_common_paths_on_every_port_first() -> None:
+    urls = wsdiscovery.candidate_device_urls("10.0.0.5", http_ports=[80, 8000], https_ports=[443])
+    assert urls[:4] == [
+        "http://10.0.0.5:80/onvif/device_service",
+        "http://10.0.0.5:8000/onvif/device_service",
+        "https://10.0.0.5:443/onvif/device_service",
+        "http://10.0.0.5:80/onvif/Device",
+    ]
+    assert urls[-1] == "https://10.0.0.5:443/service/device"
+    assert len(urls) == len(set(urls)) == 3 * len(wsdiscovery.ONVIF_DEVICE_PATHS)
+    assert wsdiscovery.candidate_device_urls("fe80::1", http_ports=[80], https_ports=[])[0] == (
+        "http://[fe80::1]:80/onvif/device_service"
+    )
+
+
+def _onvif_on(path: str, *, port: int) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert b"UsernameToken" not in request.content
+        if request.url.port == port and request.url.path == path:
+            return httpx.Response(
+                200,
+                text="<s:Envelope><s:Body><GetSystemDateAndTimeResponse><SystemDateAndTime/>"
+                "</GetSystemDateAndTimeResponse></s:Body></s:Envelope>",
+            )
+        if request.url.path == "/onvif/device_service":
+            return httpx.Response(404, text="<html>not here</html>")
+        raise httpx.ConnectError("refused", request=request)
+
+    return handler
+
+
+def test_find_device_service_tries_only_open_ports(monkeypatch: pytest.MonkeyPatch) -> None:
+    probed: list[int] = []
+
+    def port_open(_host: str, port: int, _timeout: float) -> bool:
+        probed.append(port)
+        return port in (80, 8000)
+
+    monkeypatch.setattr(wsdiscovery, "_port_open", port_open)
+    url = wsdiscovery.find_device_service(
+        "10.0.0.5", transport=httpx.MockTransport(_onvif_on("/onvif/Device", port=8000))
+    )
+    assert url == "http://10.0.0.5:8000/onvif/Device"
+    assert sorted(probed) == sorted({*wsdiscovery.ONVIF_HTTP_PORTS, *wsdiscovery.ONVIF_HTTPS_PORTS})
+
+
+def test_find_device_service_reports_nothing_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(wsdiscovery, "_port_open", lambda *_a: False)
+    assert wsdiscovery.find_device_service("10.0.0.5") is None
+
+
+async def test_find_device_service_async(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def port_open(_host: str, port: int, _timeout: float) -> bool:
+        return port == 2020
+
+    monkeypatch.setattr(wsdiscovery, "_port_open_async", port_open)
+    url = await wsdiscovery.find_device_service_async(
+        "10.0.0.5", transport=httpx.MockTransport(_onvif_on("/onvif/device_service", port=2020))
+    )
+    assert url == "http://10.0.0.5:2020/onvif/device_service"
+
+
+def test_a_soap_fault_still_identifies_an_onvif_endpoint() -> None:
+    assert wsdiscovery._answers_onvif(400, "<Envelope><Body><Fault/></Body></Envelope>")
+    assert not wsdiscovery._answers_onvif(404, "<Envelope><Fault/></Envelope>")
+    assert not wsdiscovery._answers_onvif(200, "<html>camera login</html>")

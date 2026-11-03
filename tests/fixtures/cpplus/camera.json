@@ -1,0 +1,13 @@
+{
+  "manufacturer": "CPPlus",
+  "model": "CP-UNP-D2521L10-DAQ",
+  "firmware": "3.200.00AT002.0.R",
+  "services": [
+    "device",
+    "media",
+    "media2",
+    "imaging",
+    "ptz"
+  ],
+  "recorded_at": "2026-10-15"
+}

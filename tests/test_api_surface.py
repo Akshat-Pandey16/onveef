@@ -29,6 +29,15 @@ _SKIP = {
     "pull_point",
     "require",
     "set_endpoint",
+    # Read-modify-write helpers act on device state the generic reply cannot supply (an
+    # account, a PTZ profile, an encoder token, a change to make); test_settings_updates.py
+    # and test_ptz_helpers.py drive each of them against a realistic device instead.
+    "change_password",
+    "imaging_update_settings",
+    "ptz_capabilities",
+    "ptz_center",
+    "set_video_source_rotation",
+    "update_video_encoder_configuration",
 }
 
 _BY_NAME: dict[str, Any] = {

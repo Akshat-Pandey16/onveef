@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
-from onveef import envelopes, parsers
+from onveef import envelopes, parsers, ptz
+from onveef.exceptions import (
+    OnvifCapabilityMissingError,
+    OnvifFaultError,
+    OnvifOperationNotSupportedError,
+)
 from onveef.transport import (
     SyncTransport,
+)
+
+# A lens query the device cannot answer just means "no lens control", not a failure.
+_LENS_UNANSWERED = (
+    OnvifCapabilityMissingError,
+    OnvifOperationNotSupportedError,
+    OnvifFaultError,
 )
 
 
@@ -39,8 +52,14 @@ class PtzOperations(SyncTransport):
         tilt: float | None,
         zoom: float | None,
         timeout: str = "",
+        pan_tilt_space: str = "",
+        zoom_space: str = "",
     ) -> None:
-        """Send the ONVIF ``ContinuousMove`` request to the PTZ service."""
+        """Send the ONVIF ``ContinuousMove`` request to the PTZ service.
+
+        ``pan_tilt_space``/``zoom_space`` name the velocity spaces (URIs listed by
+        :meth:`ptz_get_nodes`); empty means the node's default space.
+        """
         self.call(
             service="ptz",
             operation="ContinuousMove",
@@ -50,6 +69,8 @@ class PtzOperations(SyncTransport):
                 tilt=tilt,
                 zoom=zoom,
                 timeout=timeout,
+                pan_tilt_space=pan_tilt_space,
+                zoom_space=zoom_space,
             ),
         )
 
@@ -63,8 +84,14 @@ class PtzOperations(SyncTransport):
         speed_pan: float | None = None,
         speed_tilt: float | None = None,
         speed_zoom: float | None = None,
+        pan_tilt_space: str = "",
+        zoom_space: str = "",
     ) -> None:
-        """Send the ONVIF ``AbsoluteMove`` request to the PTZ service."""
+        """Send the ONVIF ``AbsoluteMove`` request to the PTZ service.
+
+        ``pan_tilt_space``/``zoom_space`` name the position spaces the coordinates are in
+        (e.g. a degrees space from :meth:`ptz_get_nodes`); empty means the node's default.
+        """
         self.call(
             service="ptz",
             operation="AbsoluteMove",
@@ -76,6 +103,8 @@ class PtzOperations(SyncTransport):
                 speed_pan=speed_pan,
                 speed_tilt=speed_tilt,
                 speed_zoom=speed_zoom,
+                pan_tilt_space=pan_tilt_space,
+                zoom_space=zoom_space,
             ),
         )
 
@@ -89,8 +118,14 @@ class PtzOperations(SyncTransport):
         speed_pan: float | None = None,
         speed_tilt: float | None = None,
         speed_zoom: float | None = None,
+        pan_tilt_space: str = "",
+        zoom_space: str = "",
     ) -> None:
-        """Send the ONVIF ``RelativeMove`` request to the PTZ service."""
+        """Send the ONVIF ``RelativeMove`` request to the PTZ service.
+
+        ``pan_tilt_space``/``zoom_space`` name the translation spaces; see
+        :meth:`ptz_center` for moving in ``TranslationSpaceFov``.
+        """
         self.call(
             service="ptz",
             operation="RelativeMove",
@@ -102,6 +137,8 @@ class PtzOperations(SyncTransport):
                 speed_pan=speed_pan,
                 speed_tilt=speed_tilt,
                 speed_zoom=speed_zoom,
+                pan_tilt_space=pan_tilt_space,
+                zoom_space=zoom_space,
             ),
         )
 
@@ -385,3 +422,111 @@ class PtzOperations(SyncTransport):
                 area_width=area_width,
             ),
         )
+
+    def ptz_capabilities(self, *, profile_token: str = "") -> dict[str, Any]:
+        """Summarise what the PTZ behind a media profile can do.
+
+        Reads the profile, its PTZ node and — for focus and iris — the imaging options of
+        its video source, and condenses them with :func:`onveef.ptz.capabilities`: which
+        move types and axes exist, ``click_to_center`` (and the ``fov_space`` it needs),
+        ``presets``, ``preset_tours``, ``home``, ``focus``/``iris`` and the speed ranges.
+
+        Args:
+            profile_token: The profile to drive; by default the first with a PTZ
+                configuration.
+
+        Raises:
+            OnvifCapabilityMissingError: no PTZ service, no such profile, or a profile
+                without a PTZ configuration.
+        """
+        profile, node = self._ptz_profile_and_node(profile_token)
+        source = str((profile.get("video_source") or {}).get("source_token") or "")
+        imaging_options: dict[str, Any] = {}
+        move_options: dict[str, Any] = {}
+        if source and self._has("imaging"):
+            with contextlib.suppress(*_LENS_UNANSWERED):
+                imaging_options = parsers.parse_imaging_options_normalized(
+                    self.call(
+                        service="imaging",
+                        operation="GetOptions",
+                        body_inner=envelopes.imaging_get_options(video_source_token=source),
+                    )
+                )
+            with contextlib.suppress(*_LENS_UNANSWERED):
+                move_options = parsers.parse_imaging_move_options(
+                    self.call(
+                        service="imaging",
+                        operation="GetMoveOptions",
+                        body_inner=envelopes.imaging_get_move_options(video_source_token=source),
+                    )
+                )
+        return ptz.capabilities(
+            profile=profile, node=node, imaging_options=imaging_options, move_options=move_options
+        )
+
+    def ptz_center(
+        self,
+        *,
+        profile_token: str,
+        x: float,
+        y: float,
+        zoom: float | None = None,
+        pan_tilt_space: str = "",
+    ) -> None:
+        """Centre the camera on a point of the current picture (click-to-center).
+
+        ``x``/``y`` locate the point as fractions of the picture, 0 to 1 from the left and
+        from the top — a click at ``(offsetX / width, offsetY / height)``. The camera makes
+        a relative move in its ``TranslationSpaceFov`` (:func:`onveef.ptz.fov_translation`);
+        ``zoom`` adds a relative zoom in the default zoom space.
+
+        Finding that space costs a ``GetProfiles`` and a ``GetNodes``; when centring
+        repeatedly, pass ``pan_tilt_space=ptz_capabilities()["fov_space"]`` to skip them.
+
+        Raises:
+            ValueError: ``x`` or ``y`` outside 0..1.
+            OnvifCapabilityMissingError: the PTZ node has no ``TranslationSpaceFov``.
+        """
+        pan, tilt = ptz.fov_translation(x, y)
+        space = pan_tilt_space
+        if not space:
+            _, node = self._ptz_profile_and_node(profile_token)
+            space = ptz.fov_space(node)
+            if not space:
+                raise OnvifCapabilityMissingError(
+                    "This PTZ node has no TranslationSpaceFov, so it cannot click-to-center."
+                )
+        self.ptz_relative_move(
+            profile_token=profile_token, pan=pan, tilt=tilt, zoom=zoom, pan_tilt_space=space
+        )
+
+    def _ptz_profile_and_node(self, profile_token: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The media profile to drive and its PTZ node."""
+        service, use_media2 = self._media_service()
+        profiles = parsers.parse_profiles(
+            self.call(
+                service=service,
+                operation="GetProfiles",
+                body_inner=envelopes.media_get_profiles(use_media2=use_media2),
+            )
+        )
+        if profile_token:
+            profile = next((p for p in profiles if p.get("token") == profile_token), None)
+            if profile is None:
+                raise OnvifCapabilityMissingError(f"The device has no profile '{profile_token}'.")
+            if not profile.get("ptz"):
+                raise OnvifCapabilityMissingError(
+                    f"Profile '{profile_token}' has no PTZ configuration."
+                )
+        else:
+            profile = next((p for p in profiles if p.get("ptz")), None)
+            if profile is None:
+                raise OnvifCapabilityMissingError("No media profile has a PTZ configuration.")
+        nodes = self.ptz_get_nodes()
+        node_token = str((profile.get("ptz") or {}).get("node_token") or "")
+        node = next((n for n in nodes if node_token and n.get("token") == node_token), None)
+        if node is None:
+            if not nodes:
+                raise OnvifCapabilityMissingError("The device reports no PTZ node.")
+            node = nodes[0]
+        return profile, node

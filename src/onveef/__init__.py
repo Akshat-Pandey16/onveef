@@ -1,6 +1,18 @@
 from __future__ import annotations
 
-from onveef import breaker, envelopes, exceptions, models, pacs, parsers, urls, wsdiscovery
+from onveef import (
+    breaker,
+    envelopes,
+    exceptions,
+    models,
+    pacs,
+    parsers,
+    ptz,
+    replay,
+    updates,
+    urls,
+    wsdiscovery,
+)
 from onveef.aclient import AsyncOnvifClient, AsyncPullPointSubscription
 from onveef.client import (
     DEFAULT_TIMEOUT_S,
@@ -22,10 +34,11 @@ from onveef.exceptions import (
     OnvifServiceUnavailableError,
     OnvifTimeoutError,
     OnvifTransportError,
+    OnvifValidationError,
 )
 from onveef.wsdiscovery import DiscoveredDevice
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = (
     "DEFAULT_TIMEOUT_S",
@@ -46,6 +59,7 @@ __all__ = (
     "OnvifServiceUnavailableError",
     "OnvifTimeoutError",
     "OnvifTransportError",
+    "OnvifValidationError",
     "PullPointSubscription",
     "__version__",
     "breaker",
@@ -55,6 +69,9 @@ __all__ = (
     "models",
     "pacs",
     "parsers",
+    "ptz",
+    "replay",
+    "updates",
     "urls",
     "wsdiscovery",
 )

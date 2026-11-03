@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -398,13 +399,81 @@ def _find_cfg(profile: ET.Element, *names: str) -> ET.Element | None:
     return None
 
 
+def _parse_multicast(block: ET.Element | None) -> dict[str, Any] | None:
+    """Read a ``tt:MulticastConfiguration`` so that a later ``Set*`` can write it back."""
+    if block is None:
+        return None
+    address = child_local(block, "Address")
+    kind = child_text(address, "Type") if address is not None else ""
+    value = ""
+    if address is not None:
+        value = child_text(address, "IPv6Address" if kind == "IPv6" else "IPv4Address")
+    return {
+        "address_type": kind or "IPv4",
+        "address": value,
+        "port": _opt_int(child_text(block, "Port")) or 0,
+        "ttl": _opt_int(child_text(block, "TTL")) or 0,
+        "auto_start": _to_bool(child_text(block, "AutoStart")),
+    }
+
+
+def _encoder_write_back_fields(cfg: ET.Element) -> dict[str, Any]:
+    """The encoder fields a ``SetVideoEncoderConfiguration`` must echo to change nothing else.
+
+    Rate control mode, guaranteed frame rate and multicast are easy to drop on a write —
+    and a dropped ``ConstantBitRate`` silently turns a CBR stream into VBR.
+    """
+    out: dict[str, Any] = {}
+    rate = child_local(cfg, "RateControl")
+    if rate is not None:
+        out["frame_rate"] = _opt_float(
+            child_text(rate, "FrameRateLimit") or rate.attrib.get("FrameRateLimit", "")
+        )
+        average = _opt_int(child_text(rate, "AverageBitRate"))
+        if average is not None:
+            out["average_bitrate_kbps"] = average
+        constant = rate.attrib.get("ConstantBitRate")
+        if constant is not None:
+            out["constant_bitrate"] = _to_bool(constant)
+    guaranteed = cfg.attrib.get("GuaranteedFrameRate")
+    if guaranteed is not None:
+        out["guaranteed_frame_rate"] = _to_bool(guaranteed)
+    multicast = _parse_multicast(child_local(cfg, "Multicast"))
+    if multicast is not None:
+        out["multicast"] = multicast
+    mpeg4 = child_local(cfg, "MPEG4")
+    if mpeg4 is not None:
+        gop = _opt_int(child_text(mpeg4, "GovLength"))
+        if gop is not None:
+            out["gop"] = gop
+        if mpeg4_profile := child_text(mpeg4, "Mpeg4Profile"):
+            out["profile"] = mpeg4_profile
+    profile = (
+        cfg.attrib.get("Profile")
+        or child_text(cfg, "Profile")
+        or next(
+            (
+                child_text(block, tag)
+                for name, tag in (("H264", "H264Profile"), ("H265", "H265Profile"))
+                if (block := child_local(cfg, name)) is not None and child_text(block, tag)
+            ),
+            "",
+        )
+    )
+    if profile:
+        out["profile"] = profile
+    return out
+
+
 def _parse_video_encoder(video_enc: ET.Element) -> dict[str, Any]:
     """Parse a video encoder config from either the Media1 or Media2 shape.
 
-    Media1 nests GovLength/Profile under ``<H264>``/``<H265>`` and rate limits under
-    ``<RateControl>`` child elements; Media2 (VideoEncoder2Configuration) carries
-    Encoding/GovLength/Profile as attributes and the rate limits as attributes on
-    ``RateControl``. This reads whichever is present.
+    Media1 nests GovLength/Profile under ``<H264>``/``<H265>`` and puts ``FrameRateLimit``,
+    ``EncodingInterval`` and ``BitrateLimit`` in ``<RateControl>``. Media2
+    (``VideoEncoder2Configuration``) carries GovLength/Profile/GuaranteedFrameRate as
+    attributes of the configuration and ``ConstantBitRate`` as an attribute of
+    ``RateControl``, whose limits stay child elements. Some firmware puts the encoding and
+    rate limits in attributes as well, so both spellings are read.
     """
     enc_info: dict[str, Any] = {
         "token": _token(video_enc),
@@ -438,6 +507,7 @@ def _parse_video_encoder(video_enc: ET.Element) -> dict[str, Any]:
     if h265 is not None:
         enc_info["gop"] = _opt_int(child_text(h265, "GovLength"))
         enc_info["h265_profile"] = child_text(h265, "H265Profile")
+    enc_info.update(_encoder_write_back_fields(video_enc))
     return enc_info
 
 
@@ -445,7 +515,8 @@ def parse_profiles(xml: str) -> list[dict[str, Any]]:
     """Parse ``GetProfiles`` (Media1 *and* Media2) into a list of profile dicts.
 
     Each profile has ``token`` and ``name`` plus any present sub-configs
-    (``video_source``, ``video_encoder``, ``audio_encoder``, ``ptz``, ``metadata``).
+    (``video_source``, ``video_encoder``, ``audio_source``, ``audio_encoder``, ``ptz``,
+    ``metadata``).
     Both the Media1 element names (e.g. ``VideoEncoderConfiguration``) and the Media2
     names nested under ``<Configurations>`` (e.g. ``VideoEncoder``) are recognised.
     Single-profile ``GetProfile`` responses, whose element is ``Profile`` rather than
@@ -470,6 +541,14 @@ def parse_profiles(xml: str) -> list[dict[str, Any]]:
         video_enc = _find_cfg(profile, "VideoEncoderConfiguration", "VideoEncoder")
         if video_enc is not None:
             out["video_encoder"] = _parse_video_encoder(video_enc)
+
+        audio_src = _find_cfg(profile, "AudioSourceConfiguration", "AudioSource")
+        if audio_src is not None:
+            out["audio_source"] = {
+                "token": _token(audio_src),
+                "name": child_text(audio_src, "Name"),
+                "source_token": child_text(audio_src, "SourceToken"),
+            }
 
         audio_enc = _find_cfg(profile, "AudioEncoderConfiguration", "AudioEncoder")
         if audio_enc is not None:
@@ -530,15 +609,18 @@ def parse_video_encoder_configurations(xml: str) -> list[dict[str, Any]]:
 
     Returns a list of config dicts, each with ``token``, ``name``, ``use_count``,
     ``encoding``, ``quality``, ``session_timeout`` plus any present of ``width``/
-    ``height``, ``fps_limit``, ``bitrate_kbps``, ``encoding_interval``, ``gop`` and
-    ``h264_profile``/``h265_profile``.
+    ``height``, ``fps_limit`` (int) and ``frame_rate`` (float), ``bitrate_kbps``,
+    ``encoding_interval``, ``gop``, ``profile`` (whatever the codec calls it) and
+    ``h264_profile``/``h265_profile``, ``constant_bitrate``, ``guaranteed_frame_rate``,
+    ``average_bitrate_kbps`` and ``multicast`` (``{address_type, address, port, ttl,
+    auto_start}``) — everything a write has to send back to leave the rest unchanged.
     """
     root = parse_xml(xml)
     if root is None:
         return []
     out: list[dict[str, Any]] = []
     for cfg in find_all_local(root, "Configurations"):
-        encoding = child_text(cfg, "Encoding")
+        encoding = child_text(cfg, "Encoding") or cfg.attrib.get("Encoding", "")
         item: dict[str, Any] = {
             "token": cfg.attrib.get("token", ""),
             "name": child_text(cfg, "Name"),
@@ -552,9 +634,15 @@ def parse_video_encoder_configurations(xml: str) -> list[dict[str, Any]]:
             item.update(res)
         rate = child_local(cfg, "RateControl")
         if rate is not None:
-            item["fps_limit"] = _opt_int(child_text(rate, "FrameRateLimit"))
-            item["bitrate_kbps"] = _opt_int(child_text(rate, "BitrateLimit"))
-            item["encoding_interval"] = _opt_int(child_text(rate, "EncodingInterval"))
+            item["fps_limit"] = _opt_int(
+                child_text(rate, "FrameRateLimit") or rate.attrib.get("FrameRateLimit", "")
+            )
+            item["bitrate_kbps"] = _opt_int(
+                child_text(rate, "BitrateLimit") or rate.attrib.get("BitrateLimit", "")
+            )
+            item["encoding_interval"] = _opt_int(
+                child_text(rate, "EncodingInterval") or rate.attrib.get("EncodingInterval", "")
+            )
         media2_gov = cfg.attrib.get("GovLength") or child_text(cfg, "GovLength")
         if media2_gov:
             item["gop"] = _opt_int(media2_gov)
@@ -581,6 +669,7 @@ def parse_video_encoder_configurations(xml: str) -> list[dict[str, Any]]:
             h265_profile = child_text(h265, "H265Profile")
             if h265_profile:
                 item["h265_profile"] = h265_profile
+        item.update(_encoder_write_back_fields(cfg))
         out.append(item)
     return out
 
@@ -588,8 +677,9 @@ def parse_video_encoder_configurations(xml: str) -> list[dict[str, Any]]:
 def parse_ptz_status(xml: str) -> dict[str, Any]:
     """Parse a PTZ ``GetStatus`` response.
 
-    Returns a dict with any present of ``pan``/``tilt``/``zoom`` (floats),
-    ``move_status`` (``{pan_tilt, zoom}``), ``error`` and ``utc_time``.
+    Returns a dict with any present of ``pan``/``tilt``/``zoom`` (floats), the
+    ``pan_tilt_space``/``zoom_space`` URIs those coordinates are expressed in when the
+    device names them, ``move_status`` (``{pan_tilt, zoom}``), ``error`` and ``utc_time``.
     """
     root = parse_xml(xml)
     if root is None:
@@ -604,10 +694,14 @@ def parse_ptz_status(xml: str) -> dict[str, Any]:
                 out["tilt"] = float(pan_tilt.attrib.get("y", "0"))
             except ValueError:
                 pass
+            if space := pan_tilt.attrib.get("space", "").strip():
+                out["pan_tilt_space"] = space
         zoom = child_local(position, "Zoom")
         if zoom is not None:
             with contextlib.suppress(ValueError):
                 out["zoom"] = float(zoom.attrib.get("x", "0"))
+            if space := zoom.attrib.get("space", "").strip():
+                out["zoom_space"] = space
     move_status = find_local(root, "MoveStatus")
     if move_status is not None:
         out["move_status"] = {
@@ -627,9 +721,15 @@ def parse_ptz_nodes(xml: str) -> list[dict[str, Any]]:
     """Parse a PTZ ``GetNodes`` response.
 
     Returns a list of node dicts, each with ``token``, ``fixed_home_position``,
-    ``name``, ``max_presets``, ``home_supported`` and an optional ``ranges`` dict
-    mapping space labels (e.g. ``absolute_pan_tilt``, ``continuous_zoom``) to range
-    dicts (``uri`` plus ``x``/``y`` ``{min, max}`` entries).
+    ``geo_move`` (whether the node accepts ``GeoMove``), ``name``, ``max_presets``,
+    ``home_supported``, ``auxiliary_commands`` (list of str), ``max_preset_tours`` (int)
+    and ``preset_tour_operations`` (list of str), plus, when the node lists its spaces:
+
+    * ``spaces`` — every advertised space per label (``absolute_pan_tilt``,
+      ``relative_pan_tilt``, ``continuous_zoom``, ``pan_tilt_speed``, …), each a list of
+      ``{uri, x, y}`` dicts. A node typically offers several spaces of one kind, e.g. a
+      generic relative space *and* ``TranslationSpaceFov`` for click-to-center.
+    * ``ranges`` — the first space of each label, for callers that only need one.
     """
     root = parse_xml(xml)
     if root is None:
@@ -639,32 +739,48 @@ def parse_ptz_nodes(xml: str) -> list[dict[str, Any]]:
         info: dict[str, Any] = {
             "token": node.attrib.get("token", ""),
             "fixed_home_position": node.attrib.get("FixedHomePosition", ""),
+            "geo_move": _to_bool(node.attrib.get("GeoMove", "")),
             "name": child_text(node, "Name"),
             "max_presets": child_text(node, "MaximumNumberOfPresets"),
             "home_supported": child_text(node, "HomeSupported"),
+            "auxiliary_commands": _direct_texts(node, "AuxiliaryCommands"),
         }
         supported = child_local(node, "SupportedPTZSpaces")
         if supported is not None:
-            ranges: dict[str, dict[str, Any]] = {}
-            for kind, label in (
-                ("AbsolutePanTiltPositionSpace", "absolute_pan_tilt"),
-                ("AbsoluteZoomPositionSpace", "absolute_zoom"),
-                ("RelativePanTiltTranslationSpace", "relative_pan_tilt"),
-                ("RelativeZoomTranslationSpace", "relative_zoom"),
-                ("ContinuousPanTiltVelocitySpace", "continuous_pan_tilt"),
-                ("ContinuousZoomVelocitySpace", "continuous_zoom"),
-            ):
-                el = find_local(supported, kind)
-                if el is None:
-                    continue
-                ranges[label] = _parse_space_range(el)
-            info["ranges"] = ranges
+            spaces: dict[str, list[dict[str, Any]]] = {}
+            for kind, label in _PTZ_SPACE_KINDS:
+                found = [_parse_space_range(el) for el in supported if _local(el.tag) == kind]
+                if found:
+                    spaces[label] = found
+            info["spaces"] = spaces
+            info["ranges"] = {label: found[0] for label, found in spaces.items()}
+        tours = find_local(node, "SupportedPresetTour")
+        info["max_preset_tours"] = (
+            _opt_int(child_text(tours, "MaximumNumberOfPresetTours")) or 0
+            if tours is not None
+            else 0
+        )
+        info["preset_tour_operations"] = (
+            _direct_texts(tours, "PTZPresetTourOperation") if tours is not None else []
+        )
         nodes.append(info)
     return nodes
 
 
+_PTZ_SPACE_KINDS: tuple[tuple[str, str], ...] = (
+    ("AbsolutePanTiltPositionSpace", "absolute_pan_tilt"),
+    ("AbsoluteZoomPositionSpace", "absolute_zoom"),
+    ("RelativePanTiltTranslationSpace", "relative_pan_tilt"),
+    ("RelativeZoomTranslationSpace", "relative_zoom"),
+    ("ContinuousPanTiltVelocitySpace", "continuous_pan_tilt"),
+    ("ContinuousZoomVelocitySpace", "continuous_zoom"),
+    ("PanTiltSpeedSpace", "pan_tilt_speed"),
+    ("ZoomSpeedSpace", "zoom_speed"),
+)
+
+
 def _parse_space_range(el: ET.Element) -> dict[str, Any]:
-    out: dict[str, Any] = {"uri": child_text(el, "URI")}
+    out: dict[str, Any] = {"uri": child_text(el, "URI") or child_text(el, "SpaceURI")}
     for axis_label, tag in (("x", "XRange"), ("y", "YRange")):
         rng = find_local(el, tag)
         if rng is None:
@@ -725,7 +841,10 @@ def parse_imaging_settings(xml: str) -> dict[str, Any]:
     Returns a dict with any present of the scalar keys ``Brightness``,
     ``ColorSaturation``, ``Contrast``, ``Sharpness`` (floats); the nested dicts
     ``BacklightCompensation``, ``WideDynamicRange``, ``WhiteBalance``, ``Exposure``
-    and ``Focus``; and the ``IrCutFilter`` mode string.
+    and ``Focus``; the ``IrCutFilter`` mode string; and, from the settings extensions,
+    ``ImageStabilization``, ``ToneCompensation``, ``Defogging`` (each ``{mode, level}``),
+    ``NoiseReduction`` (``{level}``) and ``IrCutFilterAutoAdjustment``
+    (``{boundary_type, boundary_offset, response_time}``).
     """
     root = parse_xml(xml)
     if root is None:
@@ -788,6 +907,8 @@ def parse_imaging_settings(xml: str) -> dict[str, Any]:
             "MaxExposureTime",
             "MinGain",
             "MaxGain",
+            "MinIris",
+            "MaxIris",
             "Iris",
             "ExposureTime",
             "Gain",
@@ -814,7 +935,39 @@ def parse_imaging_settings(xml: str) -> dict[str, Any]:
     ir = child_local(settings, "IrCutFilter")
     if ir is not None and ir.text:
         out["IrCutFilter"] = ir.text.strip()
+    extension = child_local(settings, "Extension")
+    if extension is not None:
+        for block_name, text_tags, float_tags in _IMAGING_EXTENSION_BLOCKS:
+            block = find_local(extension, block_name)
+            if block is None:
+                continue
+            block_out: dict[str, Any] = {}
+            for tag, key in text_tags:
+                if txt := child_text(block, tag):
+                    block_out[key] = txt
+            for tag, key in float_tags:
+                if (value := _opt_float(child_text(block, tag))) is not None:
+                    block_out[key] = value
+            if block_out:
+                out[block_name] = block_out
     return out
+
+
+# The ImagingSettings20 extension chain (Extension → Extension → Extension) as
+# (element, ((text tag, key), ...), ((float tag, key), ...)).
+_IMAGING_EXTENSION_BLOCKS: tuple[
+    tuple[str, tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]], ...
+] = (
+    ("ImageStabilization", (("Mode", "mode"),), (("Level", "level"),)),
+    (
+        "IrCutFilterAutoAdjustment",
+        (("BoundaryType", "boundary_type"), ("ResponseTime", "response_time")),
+        (("BoundaryOffset", "boundary_offset"),),
+    ),
+    ("ToneCompensation", (("Mode", "mode"),), (("Level", "level"),)),
+    ("Defogging", (("Mode", "mode"),), (("Level", "level"),)),
+    ("NoiseReduction", (), (("Level", "level"),)),
+)
 
 
 def parse_imaging_status(xml: str) -> dict[str, Any]:
@@ -1040,8 +1193,8 @@ def parse_audio_encoder_configurations(xml: str) -> list[dict[str, Any]]:
     """Parse a ``GetAudioEncoderConfigurations`` response.
 
     Returns a token-deduped list of config dicts, each with ``token``, ``name``,
-    ``encoding``, ``bitrate_kbps`` (int|None), ``sample_rate`` (int|None) and
-    ``use_count`` (int|None).
+    ``encoding``, ``bitrate_kbps`` (int|None), ``sample_rate`` (int|None),
+    ``use_count`` (int|None), ``session_timeout`` and ``multicast`` (or ``None``).
     """
     root = parse_xml(xml)
     if root is None:
@@ -1059,6 +1212,8 @@ def parse_audio_encoder_configurations(xml: str) -> list[dict[str, Any]]:
                 "bitrate_kbps": _to_int(child_text(cfg, "Bitrate")),
                 "sample_rate": _to_int(child_text(cfg, "SampleRate")),
                 "use_count": _to_int(child_text(cfg, "UseCount")),
+                "session_timeout": child_text(cfg, "SessionTimeout"),
+                "multicast": _parse_multicast(child_local(cfg, "Multicast")),
             }
         )
     seen: set[str] = set()
@@ -1096,6 +1251,151 @@ def parse_imaging_options(xml: str) -> dict[str, Any]:
         return {}
     result = _element_to_dict(options)
     return result if isinstance(result, dict) else {}
+
+
+def _option_modes(block: ET.Element | None, tag: str = "Mode") -> list[str]:
+    return [] if block is None else list(dict.fromkeys(_direct_texts(block, tag)))
+
+
+def _option_range(block: ET.Element | None, tag: str) -> dict[str, float] | None:
+    return None if block is None else _range_from(child_local(block, tag))
+
+
+def _option_level(block: ET.Element) -> dict[str, float] | None:
+    """A ``Level`` option: a ``{min, max}`` range, or ``xs:boolean`` "adjustable" (0..1)."""
+    level = child_local(block, "Level")
+    if level is None:
+        return None
+    text = (level.text or "").strip().lower()
+    if text in ("true", "false", "1", "0"):
+        return {"min": 0.0, "max": 1.0} if _to_bool(text) else None
+    return _range_from(level)
+
+
+def _option_mode_level(block: ET.Element | None) -> dict[str, Any] | None:
+    if block is None:
+        return None
+    return {"modes": _option_modes(block), "level": _option_level(block)}
+
+
+def parse_imaging_options_normalized(xml: str) -> dict[str, Any]:
+    """Parse an imaging ``GetOptions`` response into one predictable shape.
+
+    :func:`parse_imaging_options` returns the device's option tree as-is; this flattens the
+    ``ImagingOptions20`` tree, including its extensions, into what a settings UI or a
+    validator needs. Every key is always present; a setting the device does not offer is
+    ``None`` (or ``[]`` for mode lists). Ranges are ``{min, max}`` dicts.
+
+    Keys: ``brightness``, ``color_saturation``, ``contrast``, ``sharpness`` (ranges);
+    ``backlight_compensation``, ``wide_dynamic_range``, ``image_stabilization``,
+    ``tone_compensation``, ``defogging`` (each ``{modes, level}``); ``noise_reduction``
+    (``{level}``); ``white_balance`` (``{modes, cr_gain, cb_gain}``); ``exposure``
+    (``{modes, priorities, min_exposure_time, max_exposure_time, min_gain, max_gain,
+    min_iris, max_iris, exposure_time, gain, iris}``); ``focus`` (``{auto_focus_modes,
+    default_speed, near_limit, far_limit}``); ``ir_cut_filter_modes``; and
+    ``ir_cut_auto_adjustment`` (``{boundary_types, boundary_offset, response_time}``).
+    A boolean ``Level`` option (tone compensation, defogging, noise reduction) becomes the
+    range 0..1 when adjustable.
+    """
+    root = parse_xml(xml)
+    options = None if root is None else find_local(root, "ImagingOptions20")
+    if options is None and root is not None:
+        options = find_local(root, "ImagingOptions")
+    if options is None:
+        return {}
+    exposure = child_local(options, "Exposure")
+    focus = child_local(options, "Focus")
+    white_balance = child_local(options, "WhiteBalance")
+    extension = child_local(options, "Extension")
+
+    def _extension_block(*names: str) -> ET.Element | None:
+        if extension is None:
+            return None
+        for name in names:
+            found = find_local(extension, name)
+            if found is not None:
+                return found
+        return None
+
+    auto_adjustment = _extension_block(
+        "IrCutFilterAutoAdjustment", "IrCutFilterAutoAdjustmentOptions"
+    )
+    response_time = (
+        None if auto_adjustment is None else child_local(auto_adjustment, "ResponseTimeRange")
+    )
+    noise = _extension_block("NoiseReductionOptions", "NoiseReduction")
+    return {
+        "brightness": _option_range(options, "Brightness"),
+        "color_saturation": _option_range(options, "ColorSaturation"),
+        "contrast": _option_range(options, "Contrast"),
+        "sharpness": _option_range(options, "Sharpness"),
+        "backlight_compensation": _option_mode_level(child_local(options, "BacklightCompensation")),
+        "wide_dynamic_range": _option_mode_level(child_local(options, "WideDynamicRange")),
+        "white_balance": (
+            None
+            if white_balance is None
+            else {
+                "modes": _option_modes(white_balance),
+                "cr_gain": _option_range(white_balance, "YrGain"),
+                "cb_gain": _option_range(white_balance, "YbGain"),
+            }
+        ),
+        "exposure": (
+            None
+            if exposure is None
+            else {
+                "modes": _option_modes(exposure),
+                "priorities": _option_modes(exposure, "Priority"),
+                **{
+                    key: _option_range(exposure, tag)
+                    for key, tag in (
+                        ("min_exposure_time", "MinExposureTime"),
+                        ("max_exposure_time", "MaxExposureTime"),
+                        ("min_gain", "MinGain"),
+                        ("max_gain", "MaxGain"),
+                        ("min_iris", "MinIris"),
+                        ("max_iris", "MaxIris"),
+                        ("exposure_time", "ExposureTime"),
+                        ("gain", "Gain"),
+                        ("iris", "Iris"),
+                    )
+                },
+            }
+        ),
+        "focus": (
+            None
+            if focus is None
+            else {
+                "auto_focus_modes": _option_modes(focus, "AutoFocusModes"),
+                "default_speed": _option_range(focus, "DefaultSpeed"),
+                "near_limit": _option_range(focus, "NearLimit"),
+                "far_limit": _option_range(focus, "FarLimit"),
+            }
+        ),
+        "ir_cut_filter_modes": _option_modes(options, "IrCutFilterModes"),
+        "image_stabilization": _option_mode_level(_extension_block("ImageStabilization")),
+        "ir_cut_auto_adjustment": (
+            None
+            if auto_adjustment is None
+            else {
+                "boundary_types": _option_modes(auto_adjustment, "BoundaryType"),
+                "boundary_offset": _to_bool(child_text(auto_adjustment, "BoundaryOffset")),
+                "response_time": (
+                    None
+                    if response_time is None
+                    else {
+                        "min": child_text(response_time, "Min"),
+                        "max": child_text(response_time, "Max"),
+                    }
+                ),
+            }
+        ),
+        "tone_compensation": _option_mode_level(
+            _extension_block("ToneCompensationOptions", "ToneCompensation")
+        ),
+        "defogging": _option_mode_level(_extension_block("DefoggingOptions", "Defogging")),
+        "noise_reduction": None if noise is None else {"level": _option_level(noise)},
+    }
 
 
 def parse_video_encoder_options(xml: str) -> dict[str, Any]:
@@ -1195,14 +1495,42 @@ def _supported_fps_from(el: ET.Element) -> dict[str, float] | None:
     return {"min": min(nums), "max": max(nums)}
 
 
+_ENCODING_SUPPORT_FLAGS = (
+    "constant_bitrate_supported",
+    "guaranteed_frame_rate_supported",
+    "average_bitrate_supported",
+)
+
+
+def _empty_encoding_options(encoding: str) -> dict[str, Any]:
+    return {
+        "encoding": encoding,
+        "resolutions": [],
+        "fps": None,
+        "frame_rates": [],
+        "bitrate_kbps": None,
+        "gop": None,
+        "quality": None,
+        "encoding_interval": None,
+        "profiles": [],
+        **dict.fromkeys(_ENCODING_SUPPORT_FLAGS),
+    }
+
+
 def _merge_encoding(target: dict[str, Any], add: dict[str, Any]) -> None:
+    for key, value in _empty_encoding_options(target["encoding"]).items():
+        target.setdefault(key, value)
     for r in add.get("resolutions", []):
         if r not in target["resolutions"]:
             target["resolutions"].append(r)
     for p in add.get("profiles", []):
         if p not in target["profiles"]:
             target["profiles"].append(p)
-    for key in ("fps", "bitrate_kbps", "gop", "quality"):
+    target["frame_rates"] = sorted({*target["frame_rates"], *add.get("frame_rates", [])})
+    for flag in _ENCODING_SUPPORT_FLAGS:
+        if add.get(flag) is not None:
+            target[flag] = bool(target[flag]) or bool(add[flag])
+    for key in ("fps", "bitrate_kbps", "gop", "quality", "encoding_interval"):
         new = add.get(key)
         if new is None:
             continue
@@ -1253,15 +1581,42 @@ def _parse_one_options_block(
             block.attrib.get("ProfilesSupported") or block.attrib.get("H264ProfilesSupported")
         )
     out: dict[str, Any] = {
-        "encoding": encoding,
+        **_empty_encoding_options(encoding),
         "resolutions": _resolutions_from(block),
         "fps": fps,
+        "frame_rates": _frame_rate_list(block),
         "bitrate_kbps": _range_from(child_local(block, "BitrateRange")),
         "gop": gop,
         "quality": _range_from(child_local(block, "QualityRange")),
+        "encoding_interval": _range_from(child_local(block, "EncodingIntervalRange")),
         "profiles": profiles,
     }
+    for flag, attribute in zip(
+        _ENCODING_SUPPORT_FLAGS,
+        (
+            "ConstantBitRateSupported",
+            "GuaranteedFrameRateSupported",
+            "AverageBitRateSupported",
+        ),
+        strict=True,
+    ):
+        if (raw := block.attrib.get(attribute)) is not None:
+            out[flag] = _to_bool(raw)
     return out
+
+
+def _frame_rate_list(block: ET.Element) -> list[float]:
+    """The discrete frame rates a Media2 encoder accepts (``FrameRatesSupported``)."""
+    texts = [block.attrib.get("FrameRatesSupported") or ""]
+    texts += [node.text or "" for node in find_all_local(block, "FrameRatesSupported")]
+    return sorted(
+        {
+            value
+            for text in texts
+            for part in text.replace(",", " ").split()
+            if (value := _to_float_or_none(part)) is not None
+        }
+    )
 
 
 def parse_video_encoder_options_normalized(
@@ -1276,8 +1631,11 @@ def parse_video_encoder_options_normalized(
 
     Returns:
         A list of per-encoding dicts, each with ``encoding``, ``resolutions`` (list
-        of ``{width, height}``), ``fps``, ``bitrate_kbps``, ``gop`` and ``quality``
-        (each a ``{min, max}`` range or ``None``), and ``profiles`` (list of str).
+        of ``{width, height}``), ``fps``, ``bitrate_kbps``, ``gop``, ``quality`` and
+        ``encoding_interval`` (each a ``{min, max}`` range or ``None``), ``frame_rates``
+        (the discrete rates Media2 lists, sorted), ``profiles`` (list of str), and the
+        ``constant_bitrate_supported``/``guaranteed_frame_rate_supported``/
+        ``average_bitrate_supported`` flags (``None`` when the device does not say).
     """
     root = parse_xml(xml)
     if root is None:
@@ -1289,15 +1647,7 @@ def parse_video_encoder_options_normalized(
             return
         key = block_dict["encoding"]
         if key not in encodings:
-            encodings[key] = {
-                "encoding": key,
-                "resolutions": [],
-                "fps": None,
-                "bitrate_kbps": None,
-                "gop": None,
-                "quality": None,
-                "profiles": [],
-            }
+            encodings[key] = _empty_encoding_options(key)
         _merge_encoding(encodings[key], block_dict)
 
     options_blocks = find_all_local(root, "Options")
@@ -1342,19 +1692,26 @@ def parse_video_encoder_options_normalized(
                 _accept(parsed)
 
     if not encodings and encoding_hint:
-        _accept(
-            {
-                "encoding": _norm_enc(encoding_hint),
-                "resolutions": [],
-                "fps": None,
-                "bitrate_kbps": None,
-                "gop": None,
-                "quality": None,
-                "profiles": [],
-            }
-        )
+        _accept(_empty_encoding_options(_norm_enc(encoding_hint)))
 
     return list(encodings.values())
+
+
+def merge_video_encoder_options(*option_lists: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Union several :func:`parse_video_encoder_options_normalized` results, per encoding.
+
+    Devices answer ``GetVideoEncoderConfigurationOptions`` differently over Media1 and
+    Media2, and with or without a ``ProfileToken``; the union is what the encoder accepts.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for options in option_lists:
+        for block in options:
+            key = str(block.get("encoding") or "")
+            if not key:
+                continue
+            target = merged.setdefault(key, _empty_encoding_options(key))
+            _merge_encoding(target, block)
+    return list(merged.values())
 
 
 def parse_ptz_configurations(xml: str) -> list[dict[str, Any]]:
@@ -1590,6 +1947,56 @@ def parse_event_properties(xml: str) -> dict[str, Any]:
     return {"topics": sorted(set(topics))}
 
 
+_XS_DATETIME = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?$"
+)
+
+
+def _xs_datetime(text: str) -> datetime | None:
+    """Parse an ``xs:dateTime`` (``Z``, offsets, any fraction length; naive means UTC)."""
+    match = _XS_DATETIME.match(text.strip())
+    if match is None:
+        return None
+    year, month, day, hour, minute, second, fraction, zone = match.groups()
+    tz = timezone.utc
+    if zone and zone != "Z":
+        sign = -1 if zone[0] == "-" else 1
+        digits = zone[1:].replace(":", "")
+        tz = timezone(sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:])))
+    try:
+        return datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour),
+            int(minute),
+            int(second),
+            int((fraction or "0")[:6].ljust(6, "0")),
+            tzinfo=tz,
+        )
+    except ValueError:
+        return None
+
+
+def _subscription_times(root: ET.Element) -> dict[str, Any]:
+    """``current_time``/``termination_time`` plus the lifetime the device actually granted.
+
+    ``lifetime_s`` is ``TerminationTime - CurrentTime`` on the *device's* clock, so it is
+    right even when that clock is wrong — and it is often shorter than what was asked for,
+    because devices cap subscription lifetimes. ``None`` when either time is missing.
+    """
+    current = _text_of(find_local(root, "CurrentTime"))
+    termination = _text_of(find_local(root, "TerminationTime"))
+    start, end = _xs_datetime(current), _xs_datetime(termination)
+    return {
+        "current_time": current,
+        "termination_time": termination,
+        "lifetime_s": (
+            (end - start).total_seconds() if start is not None and end is not None else None
+        ),
+    }
+
+
 def _subscription_reference(xml: str) -> dict[str, Any]:
     """Parse the ``SubscriptionReference``/times block shared by every subscribe response."""
     root = parse_xml(xml)
@@ -1602,11 +2009,7 @@ def _subscription_reference(xml: str) -> dict[str, Any]:
     addr_el = find_local(ref, "Address")
     if addr_el is not None and addr_el.text:
         address = addr_el.text.strip()
-    result: dict[str, Any] = {
-        "subscription_url": address,
-        "current_time": _text_of(find_local(root, "CurrentTime")),
-        "termination_time": _text_of(find_local(root, "TerminationTime")),
-    }
+    result: dict[str, Any] = {"subscription_url": address, **_subscription_times(root)}
     params = find_local(ref, "ReferenceParameters")
     if params is not None:
         converted = _element_to_dict(params)
@@ -1619,9 +2022,22 @@ def parse_create_pull_point(xml: str) -> dict[str, Any]:
     """Parse a ``CreatePullPointSubscription`` response.
 
     Returns a dict with ``subscription_url`` (the subscription reference address),
-    ``current_time`` and ``termination_time``, or ``{}`` when no reference is present.
+    ``current_time``, ``termination_time`` and ``lifetime_s`` (the granted lifetime in
+    seconds, or ``None``), or ``{}`` when no reference is present.
     """
     return _subscription_reference(xml)
+
+
+def parse_renew(xml: str) -> dict[str, Any]:
+    """Parse a WS-BaseNotification ``Renew`` response.
+
+    Returns ``current_time``, ``termination_time`` and ``lifetime_s`` — the lifetime the
+    device granted this time, which is what the next renewal has to be scheduled from.
+    """
+    root = parse_xml(xml)
+    if root is None:
+        return {"current_time": "", "termination_time": "", "lifetime_s": None}
+    return _subscription_times(root)
 
 
 def parse_subscribe(xml: str) -> dict[str, Any]:
@@ -1763,6 +2179,34 @@ def fault_is_unsupported(fault: str) -> bool:
     """Return ``True`` if a fault reason string signals an unsupported/not-implemented operation."""
     normalized = fault.lower()
     return any(marker in normalized for marker in _UNSUPPORTED_FAULT_MARKERS)
+
+
+_AUTH_FAULT_MARKERS = (
+    "notauthorized",
+    "not authorized",
+    "unauthorized",
+    "failedauthentication",
+    "invalidsecurity",
+)
+
+
+def fault_is_auth(xml: str | bytes) -> bool:
+    """Return ``True`` if a response carries a SOAP fault that rejects the credentials.
+
+    Looks at the whole fault — code, subcodes and reason — because cameras disagree on
+    where they say it: ``ter:NotAuthorized`` with "…the sender is not authorized",
+    ``wsse:FailedAuthentication`` with "The security token could not be authenticated",
+    or ``wsse:InvalidSecurity`` when the ``Created`` timestamp is outside the device's
+    clock window — which is exactly the case clock-skew recovery has to catch.
+    """
+    root = parse_xml(xml)
+    if root is None:
+        return False
+    fault = find_local(_body(root), "Fault")
+    if fault is None:
+        return False
+    normalized = " ".join(fault.itertext()).lower()
+    return any(marker in normalized for marker in _AUTH_FAULT_MARKERS)
 
 
 def parse_recordings(xml: str) -> list[dict[str, Any]]:
@@ -2024,19 +2468,27 @@ def parse_metadata_configurations(xml: str) -> list[dict[str, Any]]:
     """Parse a ``GetMetadataConfigurations`` response.
 
     Returns a list of config dicts, each with ``token``, ``name``, ``use_count``
-    (int|None), ``analytics`` (bool) and an optional ``ptz_status`` dict
-    (``status`` and ``position`` bools).
+    (int|None), ``analytics`` (bool), ``events`` (whether events are streamed in the
+    metadata), ``events_topic_filter`` (the event filter's topic expression, ``""`` for
+    all events), ``session_timeout``, ``multicast`` (or ``None``) and an optional
+    ``ptz_status`` dict (``status`` and ``position`` bools).
     """
     root = parse_xml(xml)
     if root is None:
         return []
     out: list[dict[str, Any]] = []
     for cfg in find_all_local(root, "Configurations"):
+        events = child_local(cfg, "Events")
+        topic = None if events is None else find_local(events, "TopicExpression")
         item: dict[str, Any] = {
             "token": cfg.attrib.get("token", ""),
             "name": child_text(cfg, "Name"),
             "use_count": _to_int(child_text(cfg, "UseCount")),
             "analytics": _to_bool(child_text(cfg, "Analytics")),
+            "events": events is not None,
+            "events_topic_filter": _text_of(topic),
+            "session_timeout": child_text(cfg, "SessionTimeout"),
+            "multicast": _parse_multicast(child_local(cfg, "Multicast")),
         }
         ptz = child_local(cfg, "PTZStatus")
         if ptz is not None:
@@ -2333,8 +2785,10 @@ def parse_video_source_configuration_options(xml: str) -> dict[str, Any]:
     """Parse a ``GetVideoSourceConfigurationOptions`` response.
 
     Returns a dict with ``bounds_range`` (the ``x``/``y``/``width``/``height`` ranges the
-    device accepts), ``video_source_tokens`` and ``rotate_modes``. The full option tree is
-    preserved verbatim under ``raw`` because vendors extend it heavily.
+    device accepts), ``video_source_tokens``, ``rotate_modes``, ``rotate_degrees`` (the
+    angles ``Mode=ON`` accepts) and ``rotate_reboot`` (``True`` when changing rotation
+    reboots the device). The full option tree is preserved verbatim under ``raw`` because
+    vendors extend it heavily.
     """
     root = parse_xml(xml)
     if root is None:
@@ -2357,12 +2811,29 @@ def parse_video_source_configuration_options(xml: str) -> dict[str, Any]:
                     "max": _opt_int(child_text(el, "Max")),
                 }
         result["bounds_range"] = ranges
+    result["rotate_degrees"] = []
+    result["rotate_reboot"] = False
     rotate = find_local(options, "Rotate")
     if rotate is not None:
         result["rotate_modes"] = _direct_texts(rotate, "Mode")
+        result["rotate_degrees"] = _int_items(child_local(rotate, "DegreeList"))
+        result["rotate_reboot"] = _to_bool(rotate.attrib.get("Reboot", ""))
     raw = _element_to_dict(options)
     result["raw"] = raw if isinstance(raw, dict) else {}
     return result
+
+
+def _int_items(block: ET.Element | None) -> list[int]:
+    """The sorted values of a ``tt:IntItems`` list, one per ``Items`` or space-separated."""
+    if block is None:
+        return []
+    values = (
+        _opt_int(part)
+        for item in block
+        if _local(item.tag) == "Items"
+        for part in (item.text or "").split()
+    )
+    return sorted({value for value in values if value is not None})
 
 
 def parse_audio_encoder_configuration_options(xml: str) -> list[dict[str, Any]]:
@@ -2381,16 +2852,8 @@ def parse_audio_encoder_configuration_options(xml: str) -> list[dict[str, Any]]:
         out.append(
             {
                 "encoding": child_text(option, "Encoding"),
-                "bitrate_list": [
-                    v for v in (_opt_int(t) for t in _direct_texts(bitrates, "Items")) if v
-                ]
-                if bitrates is not None
-                else [],
-                "sample_rate_list": [
-                    v for v in (_opt_int(t) for t in _direct_texts(rates, "Items")) if v
-                ]
-                if rates is not None
-                else [],
+                "bitrate_list": [v for v in _int_items(bitrates) if v],
+                "sample_rate_list": [v for v in _int_items(rates) if v],
             }
         )
     return out
