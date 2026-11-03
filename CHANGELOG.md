@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/) (0.x while the API stabilises).
 
-## [Unreleased]
+## [0.7.0]
 
 ### Fixed
 - **`events_pull_messages()` and `pull_point()` crashed on every poll** with a bare
