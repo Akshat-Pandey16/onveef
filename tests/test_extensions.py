@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
 import pytest
@@ -178,7 +179,7 @@ def test_client_relay_output_options_routes_to_deviceio() -> None:
 def test_password_text_fallback_after_digest_401() -> None:
     """Opting in to the plaintext fallback retries a digest 401 once with PasswordText."""
     client = _client(creds=OnvifCredentials("admin", "pw"), password_text_fallback=True)
-    client._clock_synced = True
+    client._clock_checked_at = time.monotonic()  # the clock was just read: no resync
 
     def responder(envelope: str) -> tuple[int, str]:
         if "PasswordText" in envelope:
@@ -194,7 +195,7 @@ def test_password_text_fallback_after_digest_401() -> None:
 def test_password_text_fallback_is_off_by_default() -> None:
     """A digest 401 must not silently downgrade to a plaintext password."""
     client = _client(creds=OnvifCredentials("admin", "pw"))
-    client._clock_synced = True
+    client._clock_checked_at = time.monotonic()  # the clock was just read: no resync
     sent = _stub(client, lambda _e: (401, ""))
     with pytest.raises(OnvifAuthError):
         client.get_hostname()

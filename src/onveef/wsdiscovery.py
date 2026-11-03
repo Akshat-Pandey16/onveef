@@ -1,15 +1,27 @@
-"""WS-Discovery multicast probing for ONVIF devices on the local network."""
+"""Finding ONVIF devices: WS-Discovery probing, and locating a device service over HTTP.
+
+:func:`discover` multicasts a WS-Discovery probe on the local network and
+:func:`probe_device` unicasts one to a known address. For a device that does not answer
+WS-Discovery at all, :func:`find_device_service` locates its device-service URL by trying
+the ports and paths cameras commonly use.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextlib
 import logging
 import socket
+import ssl
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
+
+from onveef import envelopes
 from onveef.parsers import child_text, find_all_local, find_local, parse_xml
 
 logger = logging.getLogger("onveef")
@@ -373,3 +385,172 @@ async def discover_async(
 
     await asyncio.gather(*(probe_from(ip) for ip in targets))
     return list(results.values())
+
+
+ONVIF_DEVICE_PATHS: tuple[str, ...] = (
+    "/onvif/device_service",
+    "/onvif/Device",
+    "/onvif/services",
+    "/onvif/device",
+    "/device_service",
+    "/onvif",
+    "/ws",
+    "/service/device",
+)
+"""Paths cameras serve the ONVIF device service on, most common first."""
+
+ONVIF_HTTP_PORTS: tuple[int, ...] = (80, 8080, 8000, 8899, 2020, 8081, 81, 8088)
+"""Plain-HTTP ports cameras serve ONVIF on, most common first (8000 Reolink, 2020 Tapo…)."""
+
+ONVIF_HTTPS_PORTS: tuple[int, ...] = (443, 8443)
+"""HTTPS ports cameras serve ONVIF on."""
+
+_PRIMARY_PATHS = 3
+
+
+def candidate_device_urls(
+    host: str,
+    *,
+    http_ports: tuple[int, ...] | list[int] = ONVIF_HTTP_PORTS,
+    https_ports: tuple[int, ...] | list[int] = ONVIF_HTTPS_PORTS,
+    paths: tuple[str, ...] | list[str] = ONVIF_DEVICE_PATHS,
+) -> list[str]:
+    """Device-service URLs worth trying on ``host``, likeliest first.
+
+    The three common paths are tried on every port before the rarer ones, HTTP before HTTPS
+    within each group, so the usual answer is found in the first few attempts. Pass the
+    ports a scan found open to skip the rest.
+    """
+    netloc_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    primary, secondary = paths[:_PRIMARY_PATHS], paths[_PRIMARY_PATHS:]
+    urls: list[str] = []
+    for group in (primary, secondary):
+        for path in group:
+            urls += [f"http://{netloc_host}:{port}{path}" for port in http_ports]
+            urls += [f"https://{netloc_host}:{port}{path}" for port in https_ports]
+    return list(dict.fromkeys(urls))
+
+
+def _time_request() -> str:
+    return envelopes.build_envelope(envelopes.device_get_system_date_time())
+
+
+def _answers_onvif(status: int, text: str) -> bool:
+    """Whether a reply came from an ONVIF SOAP endpoint (a SOAP fault still counts)."""
+    if status >= 300 and status not in (400, 401, 500):
+        return False
+    return "Envelope" in text and ("SystemDateAndTime" in text or "Fault" in text)
+
+
+def _port_open(host: str, port: int, timeout_s: float) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+async def _port_open_async(host: str, port: int, timeout_s: float) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout_s)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    writer.close()
+    with contextlib.suppress(OSError):
+        await writer.wait_closed()
+    return True
+
+
+def find_device_service(
+    host: str,
+    *,
+    http_ports: tuple[int, ...] | list[int] = ONVIF_HTTP_PORTS,
+    https_ports: tuple[int, ...] | list[int] = ONVIF_HTTPS_PORTS,
+    paths: tuple[str, ...] | list[str] = ONVIF_DEVICE_PATHS,
+    timeout_s: float = 2.0,
+    verify_tls: bool | str | ssl.SSLContext = True,
+    transport: httpx.BaseTransport | None = None,
+) -> str | None:
+    """Find a device's ONVIF device-service URL when its port and path are unknown.
+
+    The fallback for cameras that do not answer WS-Discovery (:func:`probe_device` returns
+    their XAddrs directly). Checks which of the ports accept a connection, all at once, then
+    sends an unauthenticated ``GetSystemDateAndTime`` — a pre-authentication operation every
+    ONVIF device answers, so no credentials ever leave this host — to each
+    :func:`candidate_device_urls` on an open port, in order.
+
+    Returns:
+        The first URL that answered like an ONVIF endpoint (a SOAP fault counts), ready to
+        pass as ``OnvifClient(url, ...)``; ``None`` if nothing did. ``transport`` is passed
+        to ``httpx`` (e.g. ``httpx.MockTransport`` in tests).
+    """
+    ports = list(dict.fromkeys([*http_ports, *https_ports]))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(ports))) as pool:
+        reachable = dict(
+            zip(ports, pool.map(lambda p: _port_open(host, p, timeout_s), ports), strict=True)
+        )
+    urls = candidate_device_urls(
+        host,
+        http_ports=[p for p in http_ports if reachable[p]],
+        https_ports=[p for p in https_ports if reachable[p]],
+        paths=paths,
+    )
+    body = _time_request()
+    with httpx.Client(
+        timeout=timeout_s, verify=verify_tls, follow_redirects=False, transport=transport
+    ) as client:
+        for url in urls:
+            for content_type in ("application/soap+xml; charset=utf-8", "text/xml; charset=utf-8"):
+                try:
+                    reply = client.post(url, content=body, headers={"Content-Type": content_type})
+                except httpx.HTTPError as exc:
+                    logger.debug("onveef: %s did not answer: %s", url, exc)
+                    break
+                if _answers_onvif(reply.status_code, reply.text):
+                    return url
+                if reply.status_code not in (400, 415):
+                    break
+    return None
+
+
+async def find_device_service_async(
+    host: str,
+    *,
+    http_ports: tuple[int, ...] | list[int] = ONVIF_HTTP_PORTS,
+    https_ports: tuple[int, ...] | list[int] = ONVIF_HTTPS_PORTS,
+    paths: tuple[str, ...] | list[str] = ONVIF_DEVICE_PATHS,
+    timeout_s: float = 2.0,
+    verify_tls: bool | str | ssl.SSLContext = True,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> str | None:
+    """Async variant of :func:`find_device_service`."""
+
+    async def port_open(port: int) -> bool:
+        return await _port_open_async(host, port, timeout_s)
+
+    ports = list(dict.fromkeys([*http_ports, *https_ports]))
+    reachable = dict(zip(ports, await asyncio.gather(*(port_open(p) for p in ports)), strict=True))
+    urls = candidate_device_urls(
+        host,
+        http_ports=[p for p in http_ports if reachable[p]],
+        https_ports=[p for p in https_ports if reachable[p]],
+        paths=paths,
+    )
+    body = _time_request()
+    async with httpx.AsyncClient(
+        timeout=timeout_s, verify=verify_tls, follow_redirects=False, transport=transport
+    ) as client:
+        for url in urls:
+            for content_type in ("application/soap+xml; charset=utf-8", "text/xml; charset=utf-8"):
+                try:
+                    reply = await client.post(
+                        url, content=body, headers={"Content-Type": content_type}
+                    )
+                except httpx.HTTPError as exc:
+                    logger.debug("onveef: %s did not answer: %s", url, exc)
+                    break
+                if _answers_onvif(reply.status_code, reply.text):
+                    return url
+                if reply.status_code not in (400, 415):
+                    break
+    return None

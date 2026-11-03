@@ -9,16 +9,19 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import ipaddress
 import json
 import logging
+import re
 import sys
 from collections.abc import Sequence
+from datetime import date
 from pathlib import Path
 from typing import Any
 
-from onveef import envelopes, wsdiscovery
+from onveef import envelopes, parsers, wsdiscovery
 from onveef.client import DEFAULT_TIMEOUT_S, OnvifClient
-from onveef.exceptions import OnvifError
+from onveef.exceptions import OnvifAuthError, OnvifError
 
 _FIXTURE_OPERATIONS: tuple[tuple[str, str, str], ...] = (
     ("device", "GetDeviceInformation", "device_get_information"),
@@ -29,12 +32,50 @@ _FIXTURE_OPERATIONS: tuple[tuple[str, str, str], ...] = (
     ("device", "GetScopes", "device_get_scopes"),
     ("media", "GetProfiles", "media_get_profiles"),
     ("media", "GetVideoSources", "media_get_video_sources"),
-    ("media", "GetVideoEncoderConfigurations", "media_get_video_encoder_configurations"),
-    ("media", "GetVideoSourceConfigurations", "media_get_video_source_configurations"),
     ("ptz", "GetNodes", "ptz_get_nodes"),
     ("ptz", "GetConfigurations", "ptz_get_configurations"),
     ("events", "GetEventProperties", "events_get_event_properties"),
 )
+
+
+_SECRET_TEXT = re.compile(r"(<(?:[\w-]+:)?(?:SerialNumber|HardwareId)>)[^<]*(</)")
+_MAC = re.compile(r"\b[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}\b")
+_IPV4 = r"\d{1,3}(?:\.\d{1,3}){3}"
+_URL_HOST = re.compile(rf"(://)({_IPV4})")
+_ADDRESS_TEXT = re.compile(r"(<(?:[\w-]+:)?\w*Address>)([^<]+)(</)")
+_SCOPE_TEXT = re.compile(r"(onvif://www\.onvif\.org/(?:name|location)/)[^\s<]+")
+_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _documentation_ip(value: str) -> str:
+    """Map a unicast address onto a documentation range; keep anything else as it is."""
+    try:
+        address = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return value
+    if address.is_multicast or address.is_unspecified or address.is_loopback:
+        return value
+    if address.version == 6:
+        return "2001:db8::1"
+    return f"192.0.2.{int(address) % 254 + 1}"
+
+
+def scrub(xml: str) -> str:
+    """Replace what identifies a camera in a captured response with documentation values.
+
+    Serial numbers and hardware ids become ``REDACTED``, MAC addresses
+    ``00:00:5E:00:53:01``, unicast IPv4 addresses in URLs and ``*Address`` elements a
+    stand-in in 192.0.2.0/24 (the same address always gets the same one) and IPv6 ones
+    ``2001:db8::1``, and the ``name``/``location`` scopes ``REDACTED``. Multicast, loopback
+    and unspecified addresses identify nothing and are kept, as is every setting.
+    """
+    xml = _SECRET_TEXT.sub(r"\1REDACTED\2", xml)
+    xml = _MAC.sub("00:00:5E:00:53:01", xml)
+    xml = _URL_HOST.sub(lambda match: match.group(1) + _documentation_ip(match.group(2)), xml)
+    xml = _ADDRESS_TEXT.sub(
+        lambda match: match.group(1) + _documentation_ip(match.group(2)) + match.group(3), xml
+    )
+    return _SCOPE_TEXT.sub(r"\1REDACTED", xml)
 
 
 def _emit(data: Any, as_json: bool) -> None:
@@ -89,6 +130,17 @@ def _cmd_discover(args: argparse.Namespace) -> int:
         for device in devices:
             print(f"{device.device_service}\t{device.name or '?'}\t{device.hardware or '?'}")
     return 0 if devices else 1
+
+
+def _cmd_locate(args: argparse.Namespace) -> int:
+    url = wsdiscovery.find_device_service(
+        args.host, timeout_s=args.timeout, verify_tls=not args.no_verify
+    )
+    if url is None:
+        print(f"No ONVIF device service answered on {args.host}.", file=sys.stderr)
+        return 1
+    _emit({"device_service": url} if args.json else url, args.json)
+    return 0
 
 
 def _cmd_info(args: argparse.Namespace) -> int:
@@ -192,35 +244,156 @@ def _cmd_raw(args: argparse.Namespace) -> int:
     return 0
 
 
+class _Capture:
+    """Sends read-only requests and writes each reply to ``<name>.xml``."""
+
+    def __init__(self, cam: OnvifClient, out_dir: Path, *, scrubbed: bool) -> None:
+        self.cam = cam
+        self.out_dir = out_dir
+        self.scrubbed = scrubbed
+        self.written: list[str] = []
+
+    def take(
+        self, service: str, operation: str, body: str, *, prefix: str = "", token: str = ""
+    ) -> str:
+        """Capture one reply; return its (unscrubbed) XML, or ``""`` if the device refused."""
+        name = prefix + operation + (f"-{_UNSAFE_NAME.sub('_', token)}" if token else "")
+        try:
+            xml = self.cam.call(service=service, operation=operation, body_inner=body)
+        except OnvifAuthError:
+            raise  # never keep trying a refused login: many cameras lock the account
+        except OnvifError as exc:
+            print(f"skip {name}: {exc}", file=sys.stderr)
+            return ""
+        text = scrub(xml) if self.scrubbed else xml
+        (self.out_dir / f"{name}.xml").write_text(text, encoding="utf-8")
+        self.written.append(name)
+        print(f"wrote {name}.xml", file=sys.stderr)
+        return xml
+
+
+def _record(capture: _Capture) -> dict[str, Any]:
+    """Capture the fixture set; return the manifest describing the camera."""
+    cam = capture.cam
+    replies: dict[str, str] = {}
+    for service, operation, builder_name in _FIXTURE_OPERATIONS:
+        builder = getattr(envelopes, builder_name)
+        body = (
+            builder(use_media2=False) if "use_media2" in builder.__code__.co_varnames else builder()
+        )
+        replies[operation] = capture.take(service, operation, body)
+    source_tokens: set[str] = set()
+    for service in ("media", "media2"):
+        if not cam.endpoint.has(service):
+            continue
+        media2 = service == "media2"
+        prefix = "Media2-" if media2 else ""
+        if media2:
+            capture.take(
+                service, "GetProfiles", envelopes.media_get_profiles(use_media2=True), prefix=prefix
+            )
+        sources = parsers.parse_video_source_configurations(
+            capture.take(
+                service,
+                "GetVideoSourceConfigurations",
+                envelopes.media_get_video_source_configurations(use_media2=media2),
+                prefix=prefix,
+            )
+        )
+        for config in sources:
+            source_tokens.add(str(config.get("source_token") or ""))
+            capture.take(
+                service,
+                "GetVideoSourceConfigurationOptions",
+                envelopes.media_get_video_source_configuration_options(
+                    use_media2=media2, configuration_token=str(config["token"])
+                ),
+                prefix=prefix,
+                token=str(config["token"]),
+            )
+        for encoder in parsers.parse_video_encoder_configurations(
+            capture.take(
+                service,
+                "GetVideoEncoderConfigurations",
+                envelopes.media_get_video_encoder_configurations(use_media2=media2),
+                prefix=prefix,
+            )
+        ):
+            token = str(encoder["token"])
+            body = (
+                envelopes.media2_get_video_encoder_options(configuration_token=token)
+                if media2
+                else envelopes.media_get_video_encoder_options(configuration_token=token)
+            )
+            capture.take(
+                service, "GetVideoEncoderConfigurationOptions", body, prefix=prefix, token=token
+            )
+        for encoder in parsers.parse_audio_encoder_configurations(
+            capture.take(
+                service,
+                "GetAudioEncoderConfigurations",
+                envelopes.media_get_audio_encoder_configurations(use_media2=media2),
+                prefix=prefix,
+            )
+        ):
+            token = str(encoder["token"])
+            capture.take(
+                service,
+                "GetAudioEncoderConfigurationOptions",
+                envelopes.media_get_audio_encoder_configuration_options(
+                    use_media2=media2, configuration_token=token
+                ),
+                prefix=prefix,
+                token=token,
+            )
+    if cam.endpoint.has("imaging"):
+        for token in sorted(source_tokens - {""}):
+            for operation, builder in (
+                ("GetImagingSettings", envelopes.imaging_get_settings),
+                ("GetOptions", envelopes.imaging_get_options),
+                ("GetMoveOptions", envelopes.imaging_get_move_options),
+            ):
+                capture.take("imaging", operation, builder(video_source_token=token), token=token)
+    info = parsers.parse_device_information(replies.get("GetDeviceInformation", ""))
+    return {
+        "manufacturer": info.get("Manufacturer") or "unknown",
+        "model": info.get("Model") or "unknown",
+        "firmware": info.get("FirmwareVersion") or "",
+        "services": sorted(name for name, url in cam.endpoint.services.items() if url),
+        "recorded_at": date.today().isoformat(),
+        "scrubbed": capture.scrubbed,
+    }
+
+
 def _cmd_dump(args: argparse.Namespace) -> int:
-    """Capture raw responses as XML fixtures for the vendor test matrix."""
+    """Capture read-only responses as XML fixtures for the vendor test matrix."""
     out_dir = Path(args.directory)
     out_dir.mkdir(parents=True, exist_ok=True)
-    written = 0
     with _client(args) as cam:
-        for service, operation, builder_name in _FIXTURE_OPERATIONS:
-            builder = getattr(envelopes, builder_name, None)
-            if builder is None:
-                continue
-            try:
-                body = (
-                    builder(use_media2=False)
-                    if "use_media2" in builder.__code__.co_varnames
-                    else builder()
-                )
-                xml = cam.call(service=service, operation=operation, body_inner=body)
-            except OnvifError as exc:
-                print(f"skip {operation}: {exc}", file=sys.stderr)
-                continue
-            (out_dir / f"{operation}.xml").write_text(xml, encoding="utf-8")
-            written += 1
-            print(f"wrote {operation}.xml", file=sys.stderr)
+        capture = _Capture(cam, out_dir, scrubbed=not args.no_scrub)
+        try:
+            cam.connect()
+            manifest = _record(capture)
+        except OnvifAuthError as exc:
+            print(
+                f"stopped: the device refused the login ({exc}). Not retrying, so as not to "
+                "lock the account.",
+                file=sys.stderr,
+            )
+            return 1
+    (out_dir / "camera.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    note = (
+        "Redacted serial numbers, hardware ids, MAC and IP addresses and name/location\n"
+        "scopes; review the files"
+        if capture.scrubbed
+        else "Redact serials, MACs, hostnames and any credentials"
+    )
     print(
-        f"\n{written} fixtures in {out_dir}. Redact serials, MACs, hostnames and any\n"
-        "credentials before committing them — see CONTRIBUTING.md.",
+        f"\n{len(capture.written)} fixtures in {out_dir}. {note} before committing them —\n"
+        "see CONTRIBUTING.md.",
         file=sys.stderr,
     )
-    return 0 if written else 1
+    return 0 if capture.written else 1
 
 
 def _add_device_args(parser: argparse.ArgumentParser) -> None:
@@ -263,6 +436,14 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--ipv6", action="store_true", help="Also probe ff02::c")
     discover.add_argument("--address", default="", help="Unicast-probe one known address")
     discover.set_defaults(func=_cmd_discover)
+
+    locate = sub.add_parser(
+        "locate", help="Find a host's ONVIF device-service URL by trying common ports/paths"
+    )
+    locate.add_argument("host", help="Device IP or hostname")
+    locate.add_argument("--timeout", type=float, default=2.0, help="Per-attempt timeout (s)")
+    locate.add_argument("--no-verify", action="store_true", help="Skip TLS verification")
+    locate.set_defaults(func=_cmd_locate)
 
     info = sub.add_parser("info", help="Show manufacturer/model/firmware/serial")
     _add_device_args(info)
@@ -328,6 +509,11 @@ def build_parser() -> argparse.ArgumentParser:
     dump = sub.add_parser("dump", help="Capture raw XML responses as test fixtures")
     _add_device_args(dump)
     dump.add_argument("-d", "--directory", default="fixtures", help="Directory to write into")
+    dump.add_argument(
+        "--no-scrub",
+        action="store_true",
+        help="Keep serial numbers, MACs and IP addresses (scrubbed by default)",
+    )
     dump.set_defaults(func=_cmd_dump)
 
     return parser

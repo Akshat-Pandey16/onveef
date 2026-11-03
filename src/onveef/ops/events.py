@@ -22,6 +22,21 @@ from onveef.transport import (
 logger = logging.getLogger("onveef")
 
 
+def _subscription_schedule(requested_s: float, timeout: str, granted: Any) -> tuple[float, str]:
+    """When to renew a pull-point and how long each poll may wait, given its lifetime.
+
+    The lifetime is what the device granted when that is shorter than what was asked:
+    renew at half of it, and poll for at most a third so that no poll outlives it. A poll
+    ``timeout`` already within that bound is kept exactly as the caller wrote it.
+    """
+    lifetime = requested_s
+    if isinstance(granted, (int, float)) and granted > 0:
+        lifetime = min(lifetime, float(granted))
+    if _iso8601_seconds(timeout, 0.0) > lifetime / 3:
+        timeout = f"PT{max(1, int(lifetime / 3))}S"
+    return max(1.0, lifetime / 2), timeout
+
+
 class EventOperations(SyncTransport):
     """Events operations, mixed into :class:`~onveef.client.OnvifClient`."""
 
@@ -103,18 +118,26 @@ class EventOperations(SyncTransport):
                 "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest"
             ),
             operation="PullMessages",
-            read_timeout_s=_iso8601_seconds(timeout, 5.0) + 5.0,
+            read_timeout_s=self._long_poll_timeout(_iso8601_seconds(timeout, 5.0)),
         )
         return parsers.parse_pull_messages(xml)
 
-    def events_renew(self, *, subscription_url: str, termination_time: str = "PT60S") -> None:
-        """Renew an event subscription's termination time via a WS-BaseNotification ``Renew`` request to ``subscription_url``."""
-        self._post_subscription(
+    def events_renew(
+        self, *, subscription_url: str, termination_time: str = "PT60S"
+    ) -> dict[str, Any]:
+        """Renew an event subscription's termination time via a WS-BaseNotification ``Renew`` request to ``subscription_url``.
+
+        Returns the device's ``current_time``, ``termination_time`` and ``lifetime_s`` — the
+        lifetime it actually granted, which may be shorter than asked for and is what the
+        next renewal has to be scheduled from.
+        """
+        xml = self._post_subscription(
             subscription_url=subscription_url,
             body=envelopes.events_renew(termination_time=termination_time),
             wsa_action="http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/RenewRequest",
             operation="Renew",
         )
+        return parsers.parse_renew(xml)
 
     def events_unsubscribe(self, *, subscription_url: str) -> None:
         """Cancel an event subscription via a WS-BaseNotification ``Unsubscribe`` request to ``subscription_url``."""
@@ -173,9 +196,11 @@ class PullPointSubscription:
     """A pull-point subscription that keeps itself alive and tidies up on exit.
 
     Devices expire a pull-point at its ``TerminationTime`` unless renewed, and each vendor
-    reports expiry differently. This wrapper renews at half the termination interval,
-    re-creates the subscription when the device has forgotten it, and unsubscribes when the
-    ``with`` block ends. Build one with :meth:`OnvifClient.pull_point` rather than directly.
+    reports expiry differently. This wrapper renews at half the lifetime the device actually
+    *granted* (devices often cap what was asked for), keeps each long poll within a third
+    of it so a poll cannot outlive the subscription, re-creates the subscription when the
+    device has forgotten it, and unsubscribes when the ``with`` block ends. Build one with
+    :meth:`OnvifClient.pull_point` rather than directly.
     """
 
     def __init__(
@@ -194,9 +219,19 @@ class PullPointSubscription:
         self._timeout = timeout
         self._message_limit = message_limit
         self._auto_renew = auto_renew
-        self._renew_interval_s = max(1.0, _iso8601_seconds(termination_time, 60.0) / 2)
+        self._requested_s = _iso8601_seconds(termination_time, 60.0)
+        self._renew_interval_s, self._pull_timeout = _subscription_schedule(
+            self._requested_s, timeout, None
+        )
         self._renew_at = 0.0
         self.subscription_url = ""
+
+    def _schedule(self, granted: Any) -> None:
+        """Re-plan renewals and polls around the lifetime the device just granted."""
+        self._renew_interval_s, self._pull_timeout = _subscription_schedule(
+            self._requested_s, self._timeout, granted
+        )
+        self._renew_at = time.monotonic() + self._renew_interval_s
 
     @property
     def active(self) -> bool:
@@ -212,17 +247,17 @@ class PullPointSubscription:
         if not url:
             raise OnvifFaultError("Device returned a pull-point subscription with no reference.")
         self.subscription_url = url
-        self._renew_at = time.monotonic() + self._renew_interval_s
+        self._schedule(result.get("lifetime_s"))
         return url
 
     def renew(self) -> None:
         """Extend the subscription's termination time."""
         if not self.subscription_url:
             return
-        self._client.events_renew(
+        result = self._client.events_renew(
             subscription_url=self.subscription_url, termination_time=self._termination_time
         )
-        self._renew_at = time.monotonic() + self._renew_interval_s
+        self._schedule(result.get("lifetime_s"))
 
     def unsubscribe(self) -> None:
         """Cancel the subscription, ignoring a device that has already forgotten it."""
@@ -253,7 +288,7 @@ class PullPointSubscription:
         try:
             result = self._client.events_pull_messages(
                 subscription_url=self.subscription_url,
-                timeout=self._timeout,
+                timeout=self._pull_timeout,
                 message_limit=self._message_limit,
             )
         except (OnvifFaultError, OnvifOperationNotSupportedError) as exc:
@@ -262,7 +297,7 @@ class PullPointSubscription:
             self.create()
             result = self._client.events_pull_messages(
                 subscription_url=self.subscription_url,
-                timeout=self._timeout,
+                timeout=self._pull_timeout,
                 message_limit=self._message_limit,
             )
         messages = result.get("messages")

@@ -15,6 +15,7 @@ from onveef.exceptions import (
     OnvifFaultError,
     OnvifOperationNotSupportedError,
 )
+from onveef.ops.events import _subscription_schedule
 from onveef.transport import (
     _iso8601_seconds,
 )
@@ -129,18 +130,25 @@ class EventOperations(AsyncTransport):
                 "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest"
             ),
             operation="PullMessages",
-            read_timeout_s=_iso8601_seconds(timeout, 5.0) + 5.0,
+            read_timeout_s=self._long_poll_timeout(_iso8601_seconds(timeout, 5.0)),
         )
         return parsers.parse_pull_messages(xml)
 
-    async def events_renew(self, *, subscription_url: str, termination_time: str = "PT60S") -> None:
-        """Renew a subscription's termination time."""
-        await self._post_subscription(
+    async def events_renew(
+        self, *, subscription_url: str, termination_time: str = "PT60S"
+    ) -> dict[str, Any]:
+        """Renew a subscription's termination time.
+
+        Returns ``current_time``, ``termination_time`` and the ``lifetime_s`` the device
+        actually granted, as :meth:`onveef.client.OnvifClient.events_renew` does.
+        """
+        xml = await self._post_subscription(
             subscription_url=subscription_url,
             body=envelopes.events_renew(termination_time=termination_time),
             wsa_action="http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/RenewRequest",
             operation="Renew",
         )
+        return parsers.parse_renew(xml)
 
     async def events_unsubscribe(self, *, subscription_url: str) -> None:
         """Unsubscribe from a subscription."""
@@ -169,8 +177,9 @@ class EventOperations(AsyncTransport):
 class AsyncPullPointSubscription:
     """An asyncio pull-point subscription that renews itself and tidies up on exit.
 
-    The async counterpart of :class:`~onveef.client.PullPointSubscription`. Build one with
-    :meth:`AsyncOnvifClient.pull_point` rather than directly.
+    The async counterpart of :class:`~onveef.client.PullPointSubscription`, scheduling its
+    renewals and polls around the lifetime the device granted in the same way. Build one
+    with :meth:`AsyncOnvifClient.pull_point` rather than directly.
     """
 
     def __init__(
@@ -189,9 +198,19 @@ class AsyncPullPointSubscription:
         self._timeout = timeout
         self._message_limit = message_limit
         self._auto_renew = auto_renew
-        self._renew_interval_s = max(1.0, _iso8601_seconds(termination_time, 60.0) / 2)
+        self._requested_s = _iso8601_seconds(termination_time, 60.0)
+        self._renew_interval_s, self._pull_timeout = _subscription_schedule(
+            self._requested_s, timeout, None
+        )
         self._renew_at = 0.0
         self.subscription_url = ""
+
+    def _schedule(self, granted: Any) -> None:
+        """Re-plan renewals and polls around the lifetime the device just granted."""
+        self._renew_interval_s, self._pull_timeout = _subscription_schedule(
+            self._requested_s, self._timeout, granted
+        )
+        self._renew_at = time.monotonic() + self._renew_interval_s
 
     @property
     def active(self) -> bool:
@@ -207,17 +226,17 @@ class AsyncPullPointSubscription:
         if not url:
             raise OnvifFaultError("Device returned a pull-point subscription with no reference.")
         self.subscription_url = url
-        self._renew_at = time.monotonic() + self._renew_interval_s
+        self._schedule(result.get("lifetime_s"))
         return url
 
     async def renew(self) -> None:
         """Extend the subscription's termination time."""
         if not self.subscription_url:
             return
-        await self._client.events_renew(
+        result = await self._client.events_renew(
             subscription_url=self.subscription_url, termination_time=self._termination_time
         )
-        self._renew_at = time.monotonic() + self._renew_interval_s
+        self._schedule(result.get("lifetime_s"))
 
     async def unsubscribe(self) -> None:
         """Cancel the subscription, ignoring a device that has already forgotten it."""
@@ -250,7 +269,7 @@ class AsyncPullPointSubscription:
         try:
             result = await self._client.events_pull_messages(
                 subscription_url=self.subscription_url,
-                timeout=self._timeout,
+                timeout=self._pull_timeout,
                 message_limit=self._message_limit,
             )
         except (OnvifFaultError, OnvifOperationNotSupportedError) as exc:
@@ -259,7 +278,7 @@ class AsyncPullPointSubscription:
             await self.create()
             result = await self._client.events_pull_messages(
                 subscription_url=self.subscription_url,
-                timeout=self._timeout,
+                timeout=self._pull_timeout,
                 message_limit=self._message_limit,
             )
         messages = result.get("messages")

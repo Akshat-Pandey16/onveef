@@ -83,3 +83,24 @@ class OnvifOperationNotSupportedError(OnvifError):
 
     status_code = 501
     code = "onvif_operation_not_supported"
+
+
+class OnvifValidationError(OnvifError, ValueError):
+    """A requested setting is not one the device says it accepts; nothing was sent.
+
+    Raised by the read-modify-write helpers after checking a change against the device's
+    own ``Get*Options`` answer, so the problem is reported field by field instead of as an
+    opaque SOAP fault — or, worse, accepted and silently clamped.
+
+    Attributes:
+        errors: Each offending field mapped to the reasons it was refused.
+    """
+
+    status_code = 422
+    code = "onvif_invalid_settings"
+
+    def __init__(self, errors: dict[str, list[str]]) -> None:
+        super().__init__(
+            "; ".join(f"{field}: {' '.join(reasons)}" for field, reasons in errors.items())
+        )
+        self.errors = errors

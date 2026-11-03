@@ -20,25 +20,38 @@ Hikvision or Dahua response. These fixtures are the regression net for that.
 
 Legend: ✅ present · ⬚ wanted (contributions welcome)
 
-| Operation | Hikvision | Dahua | Axis | Reolink | Bosch | Uniview | Amcrest |
-|---|---|---|---|---|---|---|---|
-| GetDeviceInformation | ✅ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
-| GetProfiles | ✅ | ✅ (H265) | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
-| GetSystemDateAndTime | ⬚ | ⬚ | ✅ | ⬚ | ⬚ | ⬚ | ⬚ |
-| GetStreamUri | ⬚ | ⬚ | ⬚ | ✅ | ⬚ | ⬚ | ⬚ |
-| GetNetworkInterfaces | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
-| PullMessages | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
-| GetDoorState (Profile C) | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
+| Operation | Hikvision | Dahua | CP Plus | Axis | Reolink | Bosch | Uniview | Amcrest |
+|---|---|---|---|---|---|---|---|---|
+| GetDeviceInformation | ✅ | ⬚ | ✅ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
+| GetProfiles | ✅ | ✅ (H265) | ✅ (Media1 + Media2) | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
+| GetSystemDateAndTime | ⬚ | ⬚ | ⬚ | ✅ | ⬚ | ⬚ | ⬚ | ⬚ |
+| GetStreamUri | ⬚ | ⬚ | ⬚ | ⬚ | ✅ | ⬚ | ⬚ | ⬚ |
+| GetNetworkInterfaces | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
+| PullMessages | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
+| GetDoorState (Profile C) | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
+| Video encoder configurations + options | ⬚ | ⬚ | ✅ (Media1 + Media2) | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
+| Video source configuration options | ⬚ | ⬚ | ✅ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
+| Imaging settings + options | ⬚ | ⬚ | ✅ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
+| Audio encoder configurations + options | ⬚ | ⬚ | ✅ | ⬚ | ⬚ | ⬚ | ⬚ | ⬚ |
 
-> The seed fixtures here are schema-accurate but hand-built. **Replace/augment them
-> with real captures** from devices you own — that is what turns this from a
-> template into a real compatibility guarantee.
+> The `cpplus/` set is a real capture (a CP-UNP-D2521L10-DAQ PTZ, Dahua OEM firmware,
+> recorded read-only and scrubbed); note how its H.265 main stream comes back from Media1 as
+> a stub, because Media1 cannot express H.265. The other seed fixtures are schema-accurate
+> but hand-built. **Replace/augment them with real captures** from devices you own — that is
+> what turns this from a template into a real compatibility guarantee.
 
 ## How to capture a real response
 
 Pick whichever is easiest for the device you have:
 
-1. **From `onveef` itself** — the cheapest option. Temporarily log the raw XML:
+1. **`onveef dump`** — the cheapest option. It sends only read requests, records the
+   per-configuration option sets as `<Operation>-<token>.xml` (Media2 replies prefixed
+   `Media2-`), writes a `camera.json`, and scrubs serials, MACs, IPs and name/location
+   scopes:
+   ```bash
+   onveef dump 192.168.1.64 -u admin -p secret -d tests/fixtures/<vendor>
+   ```
+   Or capture a single reply yourself:
    ```python
    client = OnvifClient(endpoint=..., credentials=...)
    xml = client.call(service="device", operation="GetDeviceInformation",
@@ -50,8 +63,9 @@ Pick whichever is easiest for the device you have:
 3. **The ONVIF Device Manager / `onvif-cli`** — enable request logging and copy the
    response envelope.
 
-**Before committing:** scrub serial numbers, MAC addresses, external IPs, and any
-credentials. Keep the structure/namespaces exactly as the device sent them — that
+**Before committing:** review what `dump` scrubbed (or scrub serial numbers, MAC
+addresses, IPs and any credentials yourself for hand captures — `onveef.cli.scrub()` does
+the common cases). Keep the structure/namespaces exactly as the device sent them — that
 fidelity is the whole point.
 
 ## Adding a fixture to the harness

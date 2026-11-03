@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
-from onveef import envelopes, parsers, urls
+from onveef import envelopes, parsers, updates, urls
 from onveef.atransport import AsyncTransport
 from onveef.exceptions import (
     OnvifCapabilityMissingError,
+    OnvifFaultError,
+    OnvifOperationNotSupportedError,
+    OnvifValidationError,
 )
+from onveef.ops.media import _OPTIONS_REFUSED
 from onveef.transport import (
     fetch_snapshot_bytes,
 )
@@ -162,34 +167,23 @@ class MediaOperations(AsyncTransport):
         return parsers.parse_video_sources(xml)
 
     async def get_video_encoder_configurations(self) -> list[dict[str, Any]]:
-        """Return the device's video encoder configurations (preferring Media2)."""
+        """Return the list of video encoder configurations, preferring the Media2 service and falling back to legacy Media.
+
+        Each configuration carries ``service`` (``"media2"`` or ``"media"``), the service it
+        was read from.
+        """
         prefer_media2 = await self._has("media2")
         if prefer_media2:
             try:
-                xml = await self.call(
-                    service="media2",
-                    operation="GetVideoEncoderConfigurations",
-                    body_inner=envelopes.media_get_video_encoder_configurations(use_media2=True),
-                )
-                configs = parsers.parse_video_encoder_configurations(xml)
+                configs = await self._video_encoder_configurations("media2")
                 if configs:
                     return configs
             except OnvifCapabilityMissingError:
                 pass
         if await self._has("media"):
-            xml = await self.call(
-                service="media",
-                operation="GetVideoEncoderConfigurations",
-                body_inner=envelopes.media_get_video_encoder_configurations(use_media2=False),
-            )
-            return parsers.parse_video_encoder_configurations(xml)
+            return await self._video_encoder_configurations("media")
         if prefer_media2:
-            xml = await self.call(
-                service="media2",
-                operation="GetVideoEncoderConfigurations",
-                body_inner=envelopes.media_get_video_encoder_configurations(use_media2=True),
-            )
-            return parsers.parse_video_encoder_configurations(xml)
+            return await self._video_encoder_configurations("media2")
         raise OnvifCapabilityMissingError("Device does not advertise a Media service.")
 
     async def get_stream_uri(
@@ -265,21 +259,44 @@ class MediaOperations(AsyncTransport):
         width: int,
         height: int,
         quality: float,
-        fps: int,
-        bitrate_kbps: int,
-        gop: int,
+        fps: int | None = None,
+        bitrate_kbps: int | None = None,
+        gop: int | None = None,
         h264_profile: str = "",
         force_persistence: bool = True,
+        encoding_interval: int | None = None,
+        session_timeout: str = "",
+        multicast: dict[str, Any] | None = None,
+        guaranteed_frame_rate: bool | None = None,
     ) -> None:
-        """Set a video encoder configuration via the legacy Media service."""
-        if await self._has("media"):
-            service = "media"
-        else:
+        """Send the ONVIF ``SetVideoEncoderConfiguration`` request to the Media service.
+
+        Media1 replaces the configuration as a whole and requires its multicast settings and
+        session timeout, so whichever of ``multicast``, ``session_timeout``,
+        ``encoding_interval`` and ``guaranteed_frame_rate`` is not given is read back from
+        the device first and written unchanged — sending defaults instead would reset the
+        stream's multicast setup to ``0.0.0.0``. Pass ``fps`` and ``bitrate_kbps`` together
+        (or neither); ``h264_profile`` also names the MPEG-4 profile for ``MPEG4``. To
+        change a few fields and keep the rest, use :meth:`update_video_encoder_configuration`.
+        """
+        if not await self._has("media"):
             raise OnvifCapabilityMissingError(
                 "SetVideoEncoderConfiguration is only supported via the legacy Media service."
             )
+        current: dict[str, Any] = {}
+        if multicast is None or not session_timeout or encoding_interval is None:
+            current = next(
+                (
+                    c
+                    for c in await self._video_encoder_configurations("media")
+                    if c.get("token") == token
+                ),
+                {},
+            )
+        if guaranteed_frame_rate is None:
+            guaranteed_frame_rate = current.get("guaranteed_frame_rate")
         await self.call(
-            service=service,
+            service="media",
             operation="SetVideoEncoderConfiguration",
             body_inner=envelopes.media_set_video_encoder_configuration(
                 token=token,
@@ -292,7 +309,16 @@ class MediaOperations(AsyncTransport):
                 bitrate_kbps=bitrate_kbps,
                 gop=gop,
                 h264_profile=h264_profile,
+                use_count=int(current.get("use_count") or 0),
+                session_timeout=session_timeout or str(current.get("session_timeout") or "PT60S"),
                 force_persistence=force_persistence,
+                encoding_interval=(
+                    encoding_interval
+                    if encoding_interval is not None
+                    else int(current.get("encoding_interval") or 1)
+                ),
+                multicast=multicast if multicast is not None else current.get("multicast"),
+                guaranteed_frame_rate=guaranteed_frame_rate,
             ),
         )
 
@@ -387,14 +413,24 @@ class MediaOperations(AsyncTransport):
         width: int,
         height: int,
         quality: float | None,
-        fps: int | None,
+        fps: float | None,
         bitrate_kbps: int | None,
         gop: int | None,
         h264_profile: str = "",
         h265_profile: str = "",
         use_count: int = 0,
+        profile: str = "",
+        constant_bitrate: bool | None = None,
+        guaranteed_frame_rate: bool | None = None,
+        multicast: dict[str, Any] | None = None,
     ) -> None:
-        """Set a video encoder configuration via the Media2 service."""
+        """Send the ONVIF ``SetVideoEncoderConfiguration`` request to the Media2 service.
+
+        See :func:`onveef.envelopes.media2_set_video_encoder_configuration`. The
+        configuration is replaced as a whole, so pass the current ``constant_bitrate``,
+        ``guaranteed_frame_rate`` and ``multicast`` to keep them — or use
+        :meth:`update_video_encoder_configuration`, which does.
+        """
         if not await self._has("media2"):
             raise OnvifCapabilityMissingError(
                 "SetVideoEncoderConfiguration (Media2) requires the Media2 service."
@@ -415,6 +451,10 @@ class MediaOperations(AsyncTransport):
                 h264_profile=h264_profile,
                 h265_profile=h265_profile,
                 use_count=use_count,
+                profile=profile,
+                constant_bitrate=constant_bitrate,
+                guaranteed_frame_rate=guaranteed_frame_rate,
+                multicast=multicast,
             ),
         )
 
@@ -437,11 +477,30 @@ class MediaOperations(AsyncTransport):
         bitrate_kbps: int,
         sample_rate: int,
         force_persistence: bool = True,
+        session_timeout: str = "",
+        multicast: dict[str, Any] | None = None,
     ) -> None:
-        """Set an audio encoder configuration via the legacy Media service."""
+        """Send the ONVIF ``SetAudioEncoderConfiguration`` request to the Media service.
+
+        Like :meth:`set_video_encoder_configuration`, an unspecified ``multicast`` or
+        ``session_timeout`` is read back from the device and kept rather than reset.
+        ``encoding`` may be a Media2 RTP name (``PCMU``, ``MP4A-LATM``…); it is sent as the
+        Media1 codec family.
+        """
         if not await self._has("media"):
             raise OnvifCapabilityMissingError(
                 "SetAudioEncoderConfiguration is only supported via the legacy Media service."
+            )
+        current: dict[str, Any] = {}
+        if multicast is None or not session_timeout:
+            xml = await self.call(
+                service="media",
+                operation="GetAudioEncoderConfigurations",
+                body_inner=envelopes.media_get_audio_encoder_configurations(use_media2=False),
+            )
+            current = next(
+                (c for c in parsers.parse_audio_encoder_configurations(xml) if c["token"] == token),
+                {},
             )
         await self.call(
             service="media",
@@ -452,7 +511,10 @@ class MediaOperations(AsyncTransport):
                 encoding=encoding,
                 bitrate_kbps=bitrate_kbps,
                 sample_rate=sample_rate,
+                use_count=int(current.get("use_count") or 0),
+                session_timeout=session_timeout or str(current.get("session_timeout") or "PT60S"),
                 force_persistence=force_persistence,
+                multicast=multicast if multicast is not None else current.get("multicast"),
             ),
         )
 
@@ -730,9 +792,29 @@ class MediaOperations(AsyncTransport):
         ptz_status: bool = False,
         ptz_position: bool = False,
         use_count: int = 0,
+        events: bool | None = None,
+        events_topic_filter: str | None = None,
+        session_timeout: str = "",
+        multicast: dict[str, Any] | None = None,
     ) -> None:
-        """Set a metadata configuration (legacy Media service)."""
+        """Send the ONVIF ``SetMetadataConfiguration`` request to the Media service.
+
+        The configuration is replaced as a whole. ``events``/``events_topic_filter``,
+        ``session_timeout`` and ``multicast`` left at their defaults are read back from the
+        device and kept — so updating the analytics flag no longer silently stops the
+        metadata stream carrying events, or resets its multicast setup.
+        """
         await self._require_media1("SetMetadataConfiguration")
+        current: dict[str, Any] = {}
+        if (
+            events is None
+            or events_topic_filter is None
+            or multicast is None
+            or not session_timeout
+        ):
+            current = next(
+                (c for c in await self.get_metadata_configurations() if c.get("token") == token), {}
+            )
         await self.call(
             service="media",
             operation="SetMetadataConfiguration",
@@ -743,6 +825,14 @@ class MediaOperations(AsyncTransport):
                 ptz_status=ptz_status,
                 ptz_position=ptz_position,
                 use_count=use_count,
+                session_timeout=session_timeout or str(current.get("session_timeout") or "PT60S"),
+                multicast=multicast if multicast is not None else current.get("multicast"),
+                events=bool(current.get("events")) if events is None else events,
+                events_topic_filter=(
+                    str(current.get("events_topic_filter") or "")
+                    if events_topic_filter is None
+                    else events_topic_filter
+                ),
             ),
         )
 
@@ -878,16 +968,37 @@ class MediaOperations(AsyncTransport):
         token: str,
         name: str,
         source_token: str,
-        x: int = 0,
-        y: int = 0,
-        width: int = 0,
-        height: int = 0,
+        x: int | None = None,
+        y: int | None = None,
+        width: int | None = None,
+        height: int | None = None,
         use_count: int | None = None,
         rotate: str = "",
         force_persistence: bool = True,
+        rotate_degree: int | None = None,
     ) -> None:
-        """Set a video source configuration's crop bounds and optional rotation mode."""
+        """Set a video source configuration's crop bounds and optional rotation.
+
+        Without ``width``/``height`` the current bounds are read back from the device and
+        kept (writing ``0x0`` would crop the picture away); with them, an unset ``x``/``y``
+        is 0. ``rotate`` is ``OFF``, ``ON`` or ``AUTO`` and ``rotate_degree`` the angle for
+        ``ON``; see :meth:`set_video_source_rotation` to change only the rotation.
+        """
         service, use_media2 = await self._media_service()
+        if width is None or height is None:
+            current = next(
+                (
+                    c
+                    for c in await self.get_video_source_configurations()
+                    if c.get("token") == token
+                ),
+                {},
+            )
+            bounds = current.get("bounds") or {}
+            x = bounds.get("x") or 0 if x is None else x
+            y = bounds.get("y") or 0 if y is None else y
+            width = bounds.get("width") or 0 if width is None else width
+            height = bounds.get("height") or 0 if height is None else height
         await self.call(
             service=service,
             operation="SetVideoSourceConfiguration",
@@ -895,13 +1006,14 @@ class MediaOperations(AsyncTransport):
                 token=token,
                 name=name,
                 source_token=source_token,
-                x=x,
-                y=y,
-                width=width,
-                height=height,
+                x=int(x or 0),
+                y=int(y or 0),
+                width=int(width or 0),
+                height=int(height or 0),
                 use_media2=use_media2,
                 use_count=use_count,
                 rotate=rotate,
+                rotate_degree=rotate_degree,
                 force_persistence=force_persistence,
             ),
         )
@@ -1215,4 +1327,258 @@ class MediaOperations(AsyncTransport):
                 use_count=use_count,
                 force_persistence=force_persistence,
             ),
+        )
+
+    async def _video_encoder_configurations(self, service: str) -> list[dict[str, Any]]:
+        xml = await self.call(
+            service=service,
+            operation="GetVideoEncoderConfigurations",
+            body_inner=envelopes.media_get_video_encoder_configurations(
+                use_media2=service == "media2"
+            ),
+        )
+        configs = parsers.parse_video_encoder_configurations(xml)
+        for config in configs:
+            config["service"] = service
+        return configs
+
+    async def get_video_encoder_options_merged(
+        self, *, configuration_token: str
+    ) -> list[dict[str, Any]]:
+        """Return every encoding, resolution and rate an encoder configuration accepts.
+
+        Devices answer ``GetVideoEncoderConfigurationOptions`` differently over Media2 and
+        Media1, and Media2 may answer differently again when asked per profile, so this
+        asks each way the device supports — Media2 for the configuration and for every
+        profile using it, then Media1 if Media2 gave nothing — and unions the answers per
+        encoding. Returns the shape of :meth:`get_video_encoder_options_normalized`;
+        variants the device refuses are skipped, so ``[]`` means it described nothing.
+        """
+        answers: list[list[dict[str, Any]]] = []
+        if await self._has("media2"):
+            with contextlib.suppress(*_OPTIONS_REFUSED):
+                answers.append(await self._video_encoder_options("media2", configuration_token, ""))
+            profiles: list[dict[str, Any]] = []
+            with contextlib.suppress(*_OPTIONS_REFUSED):
+                profiles = await self.get_profiles()
+            for profile_token in dict.fromkeys(
+                str(profile.get("token") or "")
+                for profile in profiles
+                if (profile.get("video_encoder") or {}).get("token") == configuration_token
+            ):
+                with contextlib.suppress(*_OPTIONS_REFUSED):
+                    answers.append(
+                        await self._video_encoder_options(
+                            "media2", configuration_token, profile_token
+                        )
+                    )
+        if not any(answers) and await self._has("media"):
+            with contextlib.suppress(*_OPTIONS_REFUSED):
+                answers.append(await self._video_encoder_options("media", configuration_token, ""))
+        return parsers.merge_video_encoder_options(*answers)
+
+    async def _video_encoder_options(
+        self, service: str, configuration_token: str, profile_token: str
+    ) -> list[dict[str, Any]]:
+        body = (
+            envelopes.media2_get_video_encoder_options(
+                configuration_token=configuration_token, profile_token=profile_token
+            )
+            if service == "media2"
+            else envelopes.media_get_video_encoder_options(
+                configuration_token=configuration_token, profile_token=profile_token
+            )
+        )
+        xml = await self.call(
+            service=service, operation="GetVideoEncoderConfigurationOptions", body_inner=body
+        )
+        return parsers.parse_video_encoder_options_normalized(xml)
+
+    async def update_video_encoder_configuration(
+        self,
+        *,
+        configuration_token: str,
+        encoding: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        quality: float | None = None,
+        frame_rate: float | None = None,
+        bitrate_kbps: int | None = None,
+        gop: int | None = None,
+        profile: str | None = None,
+        constant_bitrate: bool | None = None,
+        guaranteed_frame_rate: bool | None = None,
+        encoding_interval: int | None = None,
+        multicast: dict[str, Any] | None = None,
+        name: str | None = None,
+        validate: bool = True,
+    ) -> dict[str, Any]:
+        """Change some settings of a video encoder configuration and keep all the others.
+
+        ``SetVideoEncoderConfiguration`` replaces the whole configuration, so changing the
+        bit rate alone means sending the resolution, frame rate, GOP, profile, rate-control
+        mode and multicast setup back exactly as they were. This reads the configuration,
+        overlays the arguments that are not ``None`` (:func:`onveef.updates.merge_video_encoder`),
+        checks them against the encoder's options (:meth:`get_video_encoder_options_merged`)
+        and writes the result over Media2 when the device has it, falling back to Media1
+        when Media2 refuses — except for H.265, which Media1 cannot express::
+
+            cam.update_video_encoder_configuration(configuration_token="VE0", bitrate_kbps=2048)
+
+        Args:
+            configuration_token: The encoder configuration to change.
+            frame_rate: Frames per second (Media2 accepts fractions such as ``29.97``).
+            profile: The codec profile, e.g. ``Main`` or ``High``.
+            validate: Check the changed values against the encoder's options first. Turn
+                off only for a device whose options are known to be wrong.
+
+        Returns:
+            The configuration as written (see :func:`onveef.updates.merge_video_encoder`)
+            plus ``service``, ``"media2"`` or ``"media"``.
+
+        Raises:
+            OnvifValidationError: a changed value is not one the encoder offers; nothing was
+                written. ``errors`` names each field and why.
+            OnvifCapabilityMissingError: no encoder configuration has that token.
+        """
+        changes = {
+            key: value
+            for key, value in {
+                "encoding": encoding,
+                "width": width,
+                "height": height,
+                "quality": quality,
+                "frame_rate": frame_rate,
+                "bitrate_kbps": bitrate_kbps,
+                "gop": gop,
+                "profile": profile,
+                "constant_bitrate": constant_bitrate,
+                "guaranteed_frame_rate": guaranteed_frame_rate,
+                "encoding_interval": encoding_interval,
+                "multicast": multicast,
+                "name": name,
+            }.items()
+            if value is not None
+        }
+        current = next(
+            (
+                config
+                for config in await self.get_video_encoder_configurations()
+                if config.get("token") == configuration_token
+            ),
+            None,
+        )
+        if current is None:
+            raise OnvifCapabilityMissingError(
+                f"The device has no video encoder configuration '{configuration_token}'."
+            )
+        merged = updates.merge_video_encoder(current, changes)
+        options = (
+            await self.get_video_encoder_options_merged(configuration_token=configuration_token)
+            if validate or merged["quality"] is None
+            else []
+        )
+        if validate:
+            problems = updates.check_video_encoder(merged, options, changed=changes)
+            if problems:
+                raise OnvifValidationError(problems)
+        service = await self._write_video_encoder(configuration_token, merged, options)
+        return {**merged, "service": service}
+
+    async def _write_video_encoder(
+        self, token: str, merged: dict[str, Any], options: list[dict[str, Any]]
+    ) -> str:
+        """Write a merged encoder configuration over Media2, else Media1; return which."""
+        if merged["width"] is None or merged["height"] is None:
+            raise OnvifValidationError(
+                {"resolution": ["The device reported no resolution for this encoder."]}
+            )
+        quality = merged["quality"]
+        if quality is None:
+            bounds = next(
+                (o.get("quality") for o in options if o.get("encoding") == merged["encoding"]),
+                None,
+            )
+            quality = None if bounds is None else round((bounds["min"] + bounds["max"]) / 2)
+        if quality is None:
+            raise OnvifValidationError(
+                {"quality": ["The device reported no quality for this encoder; pass one."]}
+            )
+        # Both rate limits travel together in a RateControl, or neither is sent.
+        rated = merged["frame_rate"] is not None and merged["bitrate_kbps"] is not None
+        frame_rate = merged["frame_rate"] if rated else None
+        bitrate = merged["bitrate_kbps"] if rated else None
+        if await self._has("media2"):
+            try:
+                await self.set_video_encoder_configuration_media2(
+                    token=token,
+                    name=str(merged["name"]),
+                    encoding=str(merged["encoding"]),
+                    width=int(merged["width"]),
+                    height=int(merged["height"]),
+                    quality=float(quality),
+                    fps=frame_rate,
+                    bitrate_kbps=bitrate,
+                    gop=merged["gop"],
+                    profile=str(merged["profile"]),
+                    constant_bitrate=merged["constant_bitrate"] if rated else None,
+                    guaranteed_frame_rate=merged["guaranteed_frame_rate"],
+                    multicast=merged["multicast"],
+                    use_count=int(merged["use_count"]),
+                )
+            except (OnvifFaultError, OnvifOperationNotSupportedError):
+                if merged["encoding"] == "H265" or not await self._has("media"):
+                    raise
+            else:
+                return "media2"
+        await self.set_video_encoder_configuration(
+            token=token,
+            name=str(merged["name"]),
+            encoding=str(merged["encoding"]),
+            width=int(merged["width"]),
+            height=int(merged["height"]),
+            quality=float(quality),
+            fps=None if frame_rate is None else round(frame_rate),
+            bitrate_kbps=bitrate,
+            gop=merged["gop"],
+            h264_profile=str(merged["profile"]),
+            encoding_interval=merged["encoding_interval"],
+            multicast=merged["multicast"],
+            guaranteed_frame_rate=merged["guaranteed_frame_rate"],
+        )
+        return "media"
+
+    async def set_video_source_rotation(
+        self, *, configuration_token: str, mode: str, degree: int | None = None
+    ) -> None:
+        """Rotate the picture of a video source configuration, keeping everything else.
+
+        ``mode`` is ``OFF``, ``ON`` or ``AUTO``; ``degree`` the angle for ``ON``. Check
+        :meth:`get_video_source_configuration_options` first: ``rotate_degrees`` lists the
+        angles the device accepts, and ``rotate_reboot`` warns that it reboots to apply one.
+        """
+        current = next(
+            (
+                c
+                for c in await self.get_video_source_configurations()
+                if c.get("token") == configuration_token
+            ),
+            None,
+        )
+        if current is None:
+            raise OnvifCapabilityMissingError(
+                f"The device has no video source configuration '{configuration_token}'."
+            )
+        bounds = current.get("bounds") or {}
+        await self.set_video_source_configuration(
+            token=configuration_token,
+            name=str(current.get("name") or configuration_token),
+            source_token=str(current.get("source_token") or ""),
+            x=int(bounds.get("x") or 0),
+            y=int(bounds.get("y") or 0),
+            width=int(bounds.get("width") or 0),
+            height=int(bounds.get("height") or 0),
+            use_count=current.get("use_count"),
+            rotate=mode,
+            rotate_degree=degree,
         )

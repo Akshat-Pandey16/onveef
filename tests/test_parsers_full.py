@@ -275,3 +275,107 @@ def test_named_and_text_element_helpers_tolerate_junk() -> None:
     assert parsers.parse_named_element("<not-xml", "Options") == {}
     assert parsers.parse_text_element("<not-xml", "Name") == ""
     assert parsers.parse_created_token("<not-xml", tag="Token") == ""
+
+
+_IMAGING_SETTINGS_WITH_EXTENSIONS = """
+<GetImagingSettingsResponse><ImagingSettings>
+  <Exposure><Mode>MANUAL</Mode><MinIris>1</MinIris><MaxIris>8</MaxIris><Iris>4</Iris></Exposure>
+  <Extension>
+    <ImageStabilization><Mode>ON</Mode><Level>0.5</Level></ImageStabilization>
+    <Extension>
+      <IrCutFilterAutoAdjustment>
+        <BoundaryType>ToOn</BoundaryType><BoundaryOffset>0.2</BoundaryOffset>
+        <ResponseTime>PT5S</ResponseTime>
+      </IrCutFilterAutoAdjustment>
+      <Extension>
+        <ToneCompensation><Mode>AUTO</Mode></ToneCompensation>
+        <Defogging><Mode>ON</Mode><Level>0.3</Level></Defogging>
+        <NoiseReduction><Level>0.7</Level></NoiseReduction>
+      </Extension>
+    </Extension>
+  </Extension>
+</ImagingSettings></GetImagingSettingsResponse>
+"""
+
+
+def test_imaging_settings_read_the_extension_chain() -> None:
+    settings = parsers.parse_imaging_settings(_IMAGING_SETTINGS_WITH_EXTENSIONS)
+    assert settings["Exposure"] == {"mode": "MANUAL", "MinIris": 1.0, "MaxIris": 8.0, "Iris": 4.0}
+    assert settings["ImageStabilization"] == {"mode": "ON", "level": 0.5}
+    assert settings["IrCutFilterAutoAdjustment"] == {
+        "boundary_type": "ToOn",
+        "response_time": "PT5S",
+        "boundary_offset": 0.2,
+    }
+    assert settings["ToneCompensation"] == {"mode": "AUTO"}
+    assert settings["Defogging"] == {"mode": "ON", "level": 0.3}
+    assert settings["NoiseReduction"] == {"level": 0.7}
+
+
+def test_imaging_options_normalised_reads_boolean_levels_and_extensions() -> None:
+    xml = """
+    <GetOptionsResponse><ImagingOptions>
+      <WhiteBalance><Mode>AUTO</Mode><YrGain><Min>0</Min><Max>255</Max></YrGain></WhiteBalance>
+      <IrCutFilterModes>ON</IrCutFilterModes><IrCutFilterModes>AUTO</IrCutFilterModes>
+      <Extension>
+        <ImageStabilization><Mode>OFF</Mode><Mode>ON</Mode>
+          <Level><Min>0</Min><Max>1</Max></Level></ImageStabilization>
+        <Extension>
+          <IrCutFilterAutoAdjustment><BoundaryType>Common</BoundaryType>
+            <BoundaryOffset>true</BoundaryOffset>
+            <ResponseTimeRange><Min>PT0S</Min><Max>PT30S</Max></ResponseTimeRange>
+          </IrCutFilterAutoAdjustment>
+          <Extension>
+            <ToneCompensationOptions><Mode>OFF</Mode><Level>true</Level></ToneCompensationOptions>
+            <DefoggingOptions><Mode>OFF</Mode><Level>false</Level></DefoggingOptions>
+            <NoiseReductionOptions><Level>true</Level></NoiseReductionOptions>
+          </Extension>
+        </Extension>
+      </Extension>
+    </ImagingOptions></GetOptionsResponse>
+    """
+    options = parsers.parse_imaging_options_normalized(xml)
+    assert options["white_balance"] == {
+        "modes": ["AUTO"],
+        "cr_gain": {"min": 0.0, "max": 255.0},
+        "cb_gain": None,
+    }
+    assert options["ir_cut_filter_modes"] == ["ON", "AUTO"]
+    assert options["image_stabilization"] == {
+        "modes": ["OFF", "ON"],
+        "level": {"min": 0.0, "max": 1.0},
+    }
+    assert options["ir_cut_auto_adjustment"] == {
+        "boundary_types": ["Common"],
+        "boundary_offset": True,
+        "response_time": {"min": "PT0S", "max": "PT30S"},
+    }
+    assert options["tone_compensation"] == {"modes": ["OFF"], "level": {"min": 0.0, "max": 1.0}}
+    assert options["defogging"] == {"modes": ["OFF"], "level": None}
+    assert options["noise_reduction"] == {"level": {"min": 0.0, "max": 1.0}}
+    assert parsers.parse_imaging_options_normalized("<nope") == {}
+
+
+def test_metadata_configurations_read_events_and_multicast() -> None:
+    xml = """
+    <GetMetadataConfigurationsResponse>
+      <Configurations token="M0"><Name>m</Name><UseCount>1</UseCount>
+        <Events><Filter><TopicExpression>tns1:RuleEngine//.</TopicExpression></Filter></Events>
+        <Analytics>true</Analytics>
+        <Multicast><Address><Type>IPv6</Type><IPv6Address>ff15::1</IPv6Address></Address>
+          <Port>5000</Port><TTL>1</TTL><AutoStart>1</AutoStart></Multicast>
+        <SessionTimeout>PT30S</SessionTimeout></Configurations>
+      <Configurations token="M1"><Name>quiet</Name><UseCount>0</UseCount></Configurations>
+    </GetMetadataConfigurationsResponse>
+    """
+    loud, quiet = parsers.parse_metadata_configurations(xml)
+    assert loud["events"] is True
+    assert loud["events_topic_filter"] == "tns1:RuleEngine//."
+    assert loud["multicast"] == {
+        "address_type": "IPv6",
+        "address": "ff15::1",
+        "port": 5000,
+        "ttl": 1,
+        "auto_start": True,
+    }
+    assert (quiet["events"], quiet["events_topic_filter"], quiet["multicast"]) == (False, "", None)

@@ -7,6 +7,7 @@ from typing import Any
 from onveef import envelopes, parsers, urls
 from onveef.transport import (
     SyncTransport,
+    _iso8601_seconds,
 )
 
 
@@ -192,6 +193,7 @@ class RecordingOperations(SyncTransport):
                 max_results=max_results,
                 wait_time=wait_time,
             ),
+            read_timeout_s=self._long_poll_timeout(_iso8601_seconds(wait_time, 5.0)),
         )
         return parsers.parse_recording_search_results(xml)
 
@@ -242,6 +244,7 @@ class RecordingOperations(SyncTransport):
                 max_results=max_results,
                 wait_time=wait_time,
             ),
+            read_timeout_s=self._long_poll_timeout(_iso8601_seconds(wait_time, 5.0)),
         )
         return parsers.parse_event_search_results(xml)
 
@@ -290,6 +293,7 @@ class RecordingOperations(SyncTransport):
                 max_results=max_results,
                 wait_time=wait_time,
             ),
+            read_timeout_s=self._long_poll_timeout(_iso8601_seconds(wait_time, 5.0)),
         )
         return parsers.parse_ptz_position_search_results(xml)
 
@@ -338,6 +342,7 @@ class RecordingOperations(SyncTransport):
                 max_results=max_results,
                 wait_time=wait_time,
             ),
+            read_timeout_s=self._long_poll_timeout(_iso8601_seconds(wait_time, 5.0)),
         )
         return parsers.parse_metadata_search_results(xml)
 

@@ -6,7 +6,9 @@ import base64
 import hashlib
 import secrets
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from xml.sax.saxutils import escape, quoteattr
 
 UTC = timezone.utc  # the object datetime.UTC names on Python 3.11+
@@ -290,6 +292,44 @@ def media_get_video_source_configuration_options(
     )
 
 
+def _xs_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _xs_number(value: float) -> str:
+    """Format an ``xs:float`` without a spurious ``.0`` on whole numbers."""
+    number = float(value)
+    return str(int(number)) if number.is_integer() else repr(number)
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
+def _multicast_xml(multicast: Mapping[str, Any] | None) -> str:
+    """Build a ``tt:MulticastConfiguration`` from a parsed ``multicast`` dict.
+
+    Takes the shape the configuration parsers return (``address_type``, ``address``,
+    ``port``, ``ttl``, ``auto_start``), so a read value can be written straight back.
+    ``None`` writes the unconfigured default, ``0.0.0.0`` port 0 — which *replaces* any
+    multicast setup the device had, so pass the current value to keep it.
+    """
+    settings = multicast or {}
+    kind = "IPv6" if str(settings.get("address_type") or "").upper() == "IPV6" else "IPv4"
+    address = str(settings.get("address") or ("::" if kind == "IPv6" else "0.0.0.0"))
+    return (
+        "<tt:Multicast>"
+        f"<tt:Address><tt:Type>{kind}</tt:Type>"
+        f"<tt:{kind}Address>{escape(address)}</tt:{kind}Address></tt:Address>"
+        f"<tt:Port>{int(settings.get('port') or 0)}</tt:Port>"
+        f"<tt:TTL>{int(settings.get('ttl') or 0)}</tt:TTL>"
+        f"<tt:AutoStart>{_xs_bool(_truthy(settings.get('auto_start')))}</tt:AutoStart>"
+        "</tt:Multicast>"
+    )
+
+
 def media_set_video_source_configuration(
     *,
     token: str,
@@ -302,29 +342,34 @@ def media_set_video_source_configuration(
     use_media2: bool = False,
     use_count: int | None = None,
     rotate: str = "",
+    rotate_degree: int | None = None,
     force_persistence: bool = True,
 ) -> str:
     """Build a ``SetVideoSourceConfiguration`` request (rotation, crop bounds, source).
 
     ``x``/``y``/``width``/``height`` are the ``tt:Bounds`` rectangle the configuration crops
     from the video source. ``rotate`` may be ``OFF``, ``ON`` or ``AUTO``; leave it empty to
-    omit the extension entirely. ``force_persistence`` is Media1-only and ignored for Media2.
+    omit the extension entirely. ``rotate_degree`` sets the angle for ``ON`` (and implies
+    it when ``rotate`` is empty). ``UseCount`` is a required element that devices treat as
+    read-only, so ``use_count=None`` sends ``0``. ``force_persistence`` is Media1-only and
+    ignored for Media2.
     """
     prefix = "trt2" if use_media2 else "trt"
-    attrs = f" token={quoteattr(token)}"
-    if use_count is not None:
-        attrs += f' UseCount="{int(use_count)}"'
+    if rotate_degree is not None and not rotate:
+        rotate = "ON"
     extension = ""
     if rotate:
+        degree = "" if rotate_degree is None else f"<tt:Degree>{int(rotate_degree)}</tt:Degree>"
         extension = (
             "<tt:Extension><tt:Rotate>"
-            f"<tt:Mode>{escape(rotate)}</tt:Mode>"
+            f"<tt:Mode>{escape(rotate)}</tt:Mode>{degree}"
             "</tt:Rotate></tt:Extension>"
         )
     bounds = f'<tt:Bounds x="{int(x)}" y="{int(y)}" width="{int(width)}" height="{int(height)}"/>'
     body = (
-        f"<{prefix}:Configuration{attrs}>"
+        f"<{prefix}:Configuration token={quoteattr(token)}>"
         f"<tt:Name>{escape(name)}</tt:Name>"
+        f"<tt:UseCount>{int(use_count or 0)}</tt:UseCount>"
         f"<tt:SourceToken>{escape(source_token)}</tt:SourceToken>"
         f"{bounds}{extension}"
         f"</{prefix}:Configuration>"
@@ -465,49 +510,86 @@ def media2_set_video_encoder_configuration(
     width: int,
     height: int,
     quality: float | None,
-    fps: int | None,
+    fps: float | None,
     bitrate_kbps: int | None,
     gop: int | None,
     h264_profile: str = "",
     h265_profile: str = "",
     use_count: int = 0,
+    profile: str = "",
+    constant_bitrate: bool | None = None,
+    guaranteed_frame_rate: bool | None = None,
+    multicast: Mapping[str, Any] | None = None,
 ) -> str:
     """Build a Media2 ``SetVideoEncoderConfiguration`` request.
 
-    Emits a configuration identified by ``token`` with the given ``encoding``,
-    ``width``/``height`` resolution, and optional ``quality``, ``fps``/``bitrate_kbps``
-    rate control, and ``gop`` (GovLength). The H.264/H.265 ``Profile`` attribute is
-    chosen from ``h264_profile`` or ``h265_profile`` based on ``encoding``.
-    """
-    enc_upper = encoding.upper()
-    profile = ""
-    if enc_upper == "H264":
-        profile = h264_profile
-    elif enc_upper in ("H265", "HEVC"):
-        profile = h265_profile
-    config_attrs = f" token={quoteattr(token)} Encoding={quoteattr(encoding)}"
-    if gop is not None:
-        config_attrs += f' GovLength="{gop}"'
-    if profile:
-        config_attrs += f" Profile={quoteattr(profile)}"
+    Follows ``tt:VideoEncoder2Configuration``: ``Encoding``, ``Resolution``,
+    ``RateControl``, ``Multicast`` and ``Quality`` are child *elements*, in that order, and
+    ``RateControl`` holds ``FrameRateLimit`` and ``BitrateLimit`` as elements with
+    ``ConstantBitRate`` as its attribute; ``GovLength``, ``Profile`` and
+    ``GuaranteedFrameRate`` are *attributes* of the configuration.
 
-    parts: list[str] = [
+    Args:
+        fps: ``FrameRateLimit`` (a float in Media2, e.g. ``29.97``). The schema needs
+            both limits in a ``RateControl``, so pass ``fps`` and ``bitrate_kbps``
+            together, or neither to leave rate control out.
+        profile: The codec profile (``Main``, ``High``…). When empty, ``h264_profile``
+            or ``h265_profile`` is used according to ``encoding``.
+        constant_bitrate: The ``RateControl`` mode; left out when ``None``.
+        guaranteed_frame_rate: Left out when ``None``.
+        multicast: A parsed ``multicast`` dict; left out when ``None``. The configuration
+            is replaced as a whole, so pass the current values of these three (see
+            :func:`onveef.parsers.parse_video_encoder_configurations`) to keep them —
+            :meth:`~onveef.client.OnvifClient.update_video_encoder_configuration` does.
+
+    Raises:
+        ValueError: if only one of ``fps``/``bitrate_kbps`` is given, or
+            ``constant_bitrate`` is given without them.
+    """
+    if (fps is None) != (bitrate_kbps is None):
+        raise ValueError(
+            "A Media2 RateControl carries both FrameRateLimit and BitrateLimit: "
+            "pass fps and bitrate_kbps together, or neither."
+        )
+    if constant_bitrate is not None and fps is None:
+        raise ValueError("constant_bitrate is part of RateControl: pass fps and bitrate_kbps too.")
+    if not profile:
+        upper = encoding.upper()
+        if upper in ("H264", "AVC"):
+            profile = h264_profile
+        elif upper in ("H265", "HEVC"):
+            profile = h265_profile
+    attributes = [f"token={quoteattr(token)}"]
+    if gop is not None:
+        attributes.append(f'GovLength="{int(gop)}"')
+    if profile:
+        attributes.append(f"Profile={quoteattr(profile)}")
+    if guaranteed_frame_rate is not None:
+        attributes.append(f'GuaranteedFrameRate="{_xs_bool(guaranteed_frame_rate)}"')
+    parts = [
         f"<tt:Name>{escape(name)}</tt:Name>",
-        f"<tt:UseCount>{use_count}</tt:UseCount>",
-        f"<tt:Resolution><tt:Width>{width}</tt:Width><tt:Height>{height}</tt:Height></tt:Resolution>",
+        f"<tt:UseCount>{int(use_count)}</tt:UseCount>",
+        f"<tt:Encoding>{escape(encoding)}</tt:Encoding>",
+        f"<tt:Resolution><tt:Width>{int(width)}</tt:Width>"
+        f"<tt:Height>{int(height)}</tt:Height></tt:Resolution>",
     ]
+    if fps is not None and bitrate_kbps is not None:
+        mode = (
+            "" if constant_bitrate is None else f' ConstantBitRate="{_xs_bool(constant_bitrate)}"'
+        )
+        parts.append(
+            f"<tt:RateControl{mode}>"
+            f"<tt:FrameRateLimit>{_xs_number(fps)}</tt:FrameRateLimit>"
+            f"<tt:BitrateLimit>{int(bitrate_kbps)}</tt:BitrateLimit>"
+            "</tt:RateControl>"
+        )
+    if multicast is not None:
+        parts.append(_multicast_xml(multicast))
     if quality is not None:
-        parts.append(f"<tt:Quality>{quality}</tt:Quality>")
-    rc_attrs = ' ConstantBitRate="false"'
-    if fps is not None:
-        rc_attrs += f' FrameRateLimit="{fps}"'
-    if bitrate_kbps is not None:
-        rc_attrs += f' BitrateLimit="{bitrate_kbps}"'
-    if fps is not None or bitrate_kbps is not None:
-        parts.append(f"<tt:RateControl{rc_attrs}/>")
+        parts.append(f"<tt:Quality>{_xs_number(quality)}</tt:Quality>")
     return (
         "<trt2:SetVideoEncoderConfiguration>"
-        f"<trt2:Configuration{config_attrs}>"
+        f"<trt2:Configuration {' '.join(attributes)}>"
         f"{''.join(parts)}"
         "</trt2:Configuration>"
         "</trt2:SetVideoEncoderConfiguration>"
@@ -534,57 +616,82 @@ def media_set_video_encoder_configuration(
     width: int,
     height: int,
     quality: float,
-    fps: int,
-    bitrate_kbps: int,
-    gop: int,
+    fps: int | None = None,
+    bitrate_kbps: int | None = None,
+    gop: int | None = None,
     h264_profile: str = "",
     use_count: int = 0,
     session_timeout: str = "PT60S",
     force_persistence: bool = True,
+    encoding_interval: int = 1,
+    multicast: Mapping[str, Any] | None = None,
+    guaranteed_frame_rate: bool | None = None,
+    profile: str = "",
 ) -> str:
     """Build a legacy Media ``SetVideoEncoderConfiguration`` request.
 
-    Emits the configuration named ``name`` (token ``token``) with ``encoding``,
-    ``width``/``height`` resolution, ``quality``, rate control (``fps``,
-    ``bitrate_kbps``), and ``gop``. An H.264 block with ``h264_profile`` is added for
-    H.264 encoding. ``force_persistence`` maps to the ``ForcePersistence`` flag.
+    Follows ``tt:VideoEncoderConfiguration``. ``RateControl`` (``fps``,
+    ``encoding_interval``, ``bitrate_kbps``) is sent when ``fps`` and ``bitrate_kbps`` are
+    given, and the ``H264``/``MPEG4`` block when ``gop`` is given, with ``profile`` (or
+    ``h264_profile``) defaulting to ``Main``/``SP``. Media2's ``MPV4-ES`` is written as
+    Media1's ``MPEG4``.
+
+    ``Multicast`` and ``SessionTimeout`` are required by the schema and the configuration
+    is replaced as a whole, so ``multicast=None`` writes the unconfigured ``0.0.0.0``
+    default over whatever the device had: pass the current value to keep it, as
+    :meth:`~onveef.client.OnvifClient.set_video_encoder_configuration` does.
+
+    Raises:
+        ValueError: if only one of ``fps``/``bitrate_kbps`` is given.
     """
-    resolution = (
-        f"<tt:Resolution>"
-        f"<tt:Width>{width}</tt:Width>"
-        f"<tt:Height>{height}</tt:Height>"
-        f"</tt:Resolution>"
-    )
-    h264_block = (
-        f"<tt:H264><tt:GovLength>{gop}</tt:GovLength>"
-        f"<tt:H264Profile>{escape(h264_profile or 'Main')}</tt:H264Profile></tt:H264>"
-        if encoding.upper() == "H264"
-        else ""
-    )
-    rate_control = (
-        f"<tt:RateControl>"
-        f"<tt:FrameRateLimit>{fps}</tt:FrameRateLimit>"
-        f"<tt:EncodingInterval>1</tt:EncodingInterval>"
-        f"<tt:BitrateLimit>{bitrate_kbps}</tt:BitrateLimit>"
-        f"</tt:RateControl>"
+    if (fps is None) != (bitrate_kbps is None):
+        raise ValueError(
+            "A Media1 RateControl carries FrameRateLimit, EncodingInterval and BitrateLimit: "
+            "pass fps and bitrate_kbps together, or neither."
+        )
+    upper = encoding.upper()
+    mpeg4 = upper in ("MPEG4", "MPV4-ES")
+    codec_profile = profile or h264_profile
+    codec_block = ""
+    if gop is not None and upper in ("H264", "AVC"):
+        codec_block = (
+            f"<tt:H264><tt:GovLength>{int(gop)}</tt:GovLength>"
+            f"<tt:H264Profile>{escape(codec_profile or 'Main')}</tt:H264Profile></tt:H264>"
+        )
+    elif gop is not None and mpeg4:
+        codec_block = (
+            f"<tt:MPEG4><tt:GovLength>{int(gop)}</tt:GovLength>"
+            f"<tt:Mpeg4Profile>{escape(codec_profile or 'SP')}</tt:Mpeg4Profile></tt:MPEG4>"
+        )
+    rate_control = ""
+    if fps is not None and bitrate_kbps is not None:
+        rate_control = (
+            "<tt:RateControl>"
+            f"<tt:FrameRateLimit>{round(fps)}</tt:FrameRateLimit>"
+            f"<tt:EncodingInterval>{max(1, int(encoding_interval))}</tt:EncodingInterval>"
+            f"<tt:BitrateLimit>{int(bitrate_kbps)}</tt:BitrateLimit>"
+            "</tt:RateControl>"
+        )
+    guaranteed = (
+        ""
+        if guaranteed_frame_rate is None
+        else f' GuaranteedFrameRate="{_xs_bool(guaranteed_frame_rate)}"'
     )
     return (
         "<trt:SetVideoEncoderConfiguration>"
-        f"<trt:Configuration token={quoteattr(token)}>"
+        f"<trt:Configuration token={quoteattr(token)}{guaranteed}>"
         f"<tt:Name>{escape(name)}</tt:Name>"
-        f"<tt:UseCount>{use_count}</tt:UseCount>"
-        f"<tt:Encoding>{escape(encoding)}</tt:Encoding>"
-        f"{resolution}"
-        f"<tt:Quality>{quality}</tt:Quality>"
+        f"<tt:UseCount>{int(use_count)}</tt:UseCount>"
+        f"<tt:Encoding>{escape('MPEG4' if mpeg4 else encoding)}</tt:Encoding>"
+        f"<tt:Resolution><tt:Width>{int(width)}</tt:Width>"
+        f"<tt:Height>{int(height)}</tt:Height></tt:Resolution>"
+        f"<tt:Quality>{_xs_number(quality)}</tt:Quality>"
         f"{rate_control}"
-        f"{h264_block}"
-        "<tt:Multicast>"
-        "<tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>"
-        "<tt:Port>0</tt:Port><tt:TTL>0</tt:TTL><tt:AutoStart>false</tt:AutoStart>"
-        "</tt:Multicast>"
-        f"<tt:SessionTimeout>{session_timeout}</tt:SessionTimeout>"
+        f"{codec_block}"
+        f"{_multicast_xml(multicast)}"
+        f"<tt:SessionTimeout>{escape(session_timeout or 'PT60S')}</tt:SessionTimeout>"
         "</trt:Configuration>"
-        f"<trt:ForcePersistence>{'true' if force_persistence else 'false'}</trt:ForcePersistence>"
+        f"<trt:ForcePersistence>{_xs_bool(force_persistence)}</trt:ForcePersistence>"
         "</trt:SetVideoEncoderConfiguration>"
     )
 
@@ -618,14 +725,24 @@ def _as_float(value: object) -> float | None:
         return None
 
 
-def _vector(pan: float | None, tilt: float | None, zoom: float | None) -> str:
+def _vector(
+    pan: float | None,
+    tilt: float | None,
+    zoom: float | None,
+    *,
+    pan_tilt_space: str = "",
+    zoom_space: str = "",
+) -> str:
+    """Build PTZ ``PanTilt``/``Zoom`` vector elements, naming their coordinate space if set."""
     parts: list[str] = []
     if pan is not None or tilt is not None:
         pan_v = pan if pan is not None else 0.0
         tilt_v = tilt if tilt is not None else 0.0
-        parts.append(f'<tt:PanTilt x="{pan_v}" y="{tilt_v}"/>')
+        space = f" space={quoteattr(pan_tilt_space)}" if pan_tilt_space else ""
+        parts.append(f'<tt:PanTilt x="{pan_v}" y="{tilt_v}"{space}/>')
     if zoom is not None:
-        parts.append(f'<tt:Zoom x="{zoom}"/>')
+        space = f" space={quoteattr(zoom_space)}" if zoom_space else ""
+        parts.append(f'<tt:Zoom x="{zoom}"{space}/>')
     return "".join(parts)
 
 
@@ -636,13 +753,17 @@ def ptz_continuous_move(
     tilt: float | None,
     zoom: float | None,
     timeout: str = "",
+    pan_tilt_space: str = "",
+    zoom_space: str = "",
 ) -> str:
     """Build a ``ContinuousMove`` request driving pan/tilt/zoom at the given velocities.
 
     ``pan``/``tilt``/``zoom`` are velocity components (omitted axes are left out);
     ``timeout`` is an optional ISO-8601 duration after which the device stops.
+    ``pan_tilt_space``/``zoom_space`` name the velocity spaces (URIs from
+    ``ptz_get_nodes``); empty means the node's default.
     """
-    velocity = _vector(pan, tilt, zoom)
+    velocity = _vector(pan, tilt, zoom, pan_tilt_space=pan_tilt_space, zoom_space=zoom_space)
     timeout_block = f"<tptz:Timeout>{escape(timeout)}</tptz:Timeout>" if timeout else ""
     return (
         "<tptz:ContinuousMove>"
@@ -662,13 +783,17 @@ def ptz_absolute_move(
     speed_pan: float | None = None,
     speed_tilt: float | None = None,
     speed_zoom: float | None = None,
+    pan_tilt_space: str = "",
+    zoom_space: str = "",
 ) -> str:
     """Build an ``AbsoluteMove`` request to an absolute pan/tilt/zoom position.
 
     ``pan``/``tilt``/``zoom`` give the target position; the optional ``speed_*``
     components form an accompanying speed vector when any are set.
+    ``pan_tilt_space``/``zoom_space`` name the position spaces the coordinates are in
+    (e.g. a degrees space a node advertises); empty means the node's default.
     """
-    position = _vector(pan, tilt, zoom)
+    position = _vector(pan, tilt, zoom, pan_tilt_space=pan_tilt_space, zoom_space=zoom_space)
     speed = _vector(speed_pan, speed_tilt, speed_zoom)
     speed_block = f"<tptz:Speed>{speed}</tptz:Speed>" if speed else ""
     return (
@@ -689,13 +814,18 @@ def ptz_relative_move(
     speed_pan: float | None = None,
     speed_tilt: float | None = None,
     speed_zoom: float | None = None,
+    pan_tilt_space: str = "",
+    zoom_space: str = "",
 ) -> str:
     """Build a ``RelativeMove`` request by a pan/tilt/zoom translation.
 
     ``pan``/``tilt``/``zoom`` give the relative translation; the optional ``speed_*``
     components form an accompanying speed vector when any are set.
+    ``pan_tilt_space``/``zoom_space`` name the translation spaces — e.g.
+    ``TranslationSpaceFov``, whose origin is the image centre and whose ``(1, 1)`` is the
+    image's upper-right corner, which is what click-to-center moves in.
     """
-    translation = _vector(pan, tilt, zoom)
+    translation = _vector(pan, tilt, zoom, pan_tilt_space=pan_tilt_space, zoom_space=zoom_space)
     speed = _vector(speed_pan, speed_tilt, speed_zoom)
     speed_block = f"<tptz:Speed>{speed}</tptz:Speed>" if speed else ""
     return (
@@ -850,6 +980,49 @@ def imaging_get_move_options(*, video_source_token: str) -> str:
     )
 
 
+def _mode_level(tag: str, mode: str, level: float | None) -> str:
+    """Build a ``Mode``/``Level`` imaging block, or ``""`` when neither is set."""
+    if not mode and level is None:
+        return ""
+    parts = f"<tt:Mode>{escape(mode)}</tt:Mode>" if mode else ""
+    if level is not None:
+        parts += f"<tt:Level>{level}</tt:Level>"
+    return f"<tt:{tag}>{parts}</tt:{tag}>"
+
+
+def _ir_cut_auto_adjustment(boundary_type: str, offset: float | None, response_time: str) -> str:
+    if not boundary_type and offset is None and not response_time:
+        return ""
+    parts = f"<tt:BoundaryType>{escape(boundary_type)}</tt:BoundaryType>" if boundary_type else ""
+    if offset is not None:
+        parts += f"<tt:BoundaryOffset>{offset}</tt:BoundaryOffset>"
+    if response_time:
+        parts += f"<tt:ResponseTime>{escape(response_time)}</tt:ResponseTime>"
+    return f"<tt:IrCutFilterAutoAdjustment>{parts}</tt:IrCutFilterAutoAdjustment>"
+
+
+def _imaging_extension(
+    *,
+    image_stabilization: str,
+    ir_cut_auto_adjustment: str,
+    tone_compensation: str,
+    defogging: str,
+    noise_reduction: str,
+) -> str:
+    """Nest the ``ImagingSettings20`` extensions at the depth the schema puts each one.
+
+    ``ImageStabilization`` sits in the first ``Extension``, ``IrCutFilterAutoAdjustment``
+    in the second, and tone compensation, defogging and noise reduction in the third;
+    an ``Extension`` level is only emitted when something inside it is set.
+    """
+    level_3 = tone_compensation + defogging + noise_reduction
+    level_2 = ir_cut_auto_adjustment + (
+        f"<tt:Extension>{level_3}</tt:Extension>" if level_3 else ""
+    )
+    level_1 = image_stabilization + (f"<tt:Extension>{level_2}</tt:Extension>" if level_2 else "")
+    return f"<tt:Extension>{level_1}</tt:Extension>" if level_1 else ""
+
+
 def imaging_set_settings(
     *,
     video_source_token: str,
@@ -866,83 +1039,101 @@ def imaging_set_settings(
     white_balance_cb_gain: float | None = None,
     exposure_mode: str = "",
     exposure_priority: str = "",
-    exposure_min_time: int | None = None,
-    exposure_max_time: int | None = None,
+    exposure_min_time: float | None = None,
+    exposure_max_time: float | None = None,
     exposure_min_gain: float | None = None,
     exposure_max_gain: float | None = None,
     exposure_iris: float | None = None,
     focus_auto_mode: str = "",
     ir_cut_filter: str = "",
     force_persistence: bool = True,
+    exposure_min_iris: float | None = None,
+    exposure_max_iris: float | None = None,
+    exposure_time: float | None = None,
+    exposure_gain: float | None = None,
+    focus_default_speed: float | None = None,
+    focus_near_limit: float | None = None,
+    focus_far_limit: float | None = None,
+    image_stabilization_mode: str = "",
+    image_stabilization_level: float | None = None,
+    ir_cut_auto_boundary_type: str = "",
+    ir_cut_auto_boundary_offset: float | None = None,
+    ir_cut_auto_response_time: str = "",
+    tone_compensation_mode: str = "",
+    tone_compensation_level: float | None = None,
+    defogging_mode: str = "",
+    defogging_level: float | None = None,
+    noise_reduction_level: float | None = None,
 ) -> str:
     """Build a ``SetImagingSettings`` request for a video source.
 
-    Only the parameters that are set are emitted, each in the ONVIF schema order:
-    backlight compensation, brightness, colour saturation, contrast, exposure,
-    focus auto mode, IR cut filter, sharpness, wide dynamic range, and white balance.
-    ``force_persistence`` maps to the ``ForcePersistence`` flag.
+    Only the parameters that are set are emitted, each in the ``tt:ImagingSettings20``
+    order: backlight compensation, brightness, colour saturation, contrast, exposure,
+    focus, IR cut filter, sharpness, wide dynamic range, white balance, then the
+    extensions (image stabilization; IR cut filter auto adjustment; tone compensation,
+    defogging and noise reduction). ``force_persistence`` maps to the
+    ``ForcePersistence`` flag.
+
+    The schema makes a block's mode mandatory: ``Exposure`` needs ``Mode``, ``Focus``
+    needs ``AutoFocusMode``, ``IrCutFilterAutoAdjustment`` needs ``BoundaryType`` and
+    so on. Setting only, say, ``exposure_max_time`` emits a block without it, which strict
+    devices reject; :meth:`~onveef.client.OnvifClient.imaging_update_settings` fills the
+    mode in from the current settings for you.
     """
-    fragments: list[str] = []
-    if backlight_compensation_mode or backlight_compensation_level is not None:
-        bl_parts: list[str] = []
-        if backlight_compensation_mode:
-            bl_parts.append(f"<tt:Mode>{escape(backlight_compensation_mode)}</tt:Mode>")
-        if backlight_compensation_level is not None:
-            bl_parts.append(f"<tt:Level>{backlight_compensation_level}</tt:Level>")
-        fragments.append(
-            f"<tt:BacklightCompensation>{''.join(bl_parts)}</tt:BacklightCompensation>"
+    fragments = [
+        _mode_level(
+            "BacklightCompensation", backlight_compensation_mode, backlight_compensation_level
         )
+    ]
     if brightness is not None:
         fragments.append(f"<tt:Brightness>{brightness}</tt:Brightness>")
     if color_saturation is not None:
         fragments.append(f"<tt:ColorSaturation>{color_saturation}</tt:ColorSaturation>")
     if contrast is not None:
         fragments.append(f"<tt:Contrast>{contrast}</tt:Contrast>")
-    if (
-        exposure_mode
-        or exposure_priority
-        or any(
-            v is not None
-            for v in (
-                exposure_min_time,
-                exposure_max_time,
-                exposure_min_gain,
-                exposure_max_gain,
-                exposure_iris,
-            )
-        )
-    ):
+    exposure_values = (
+        ("MinExposureTime", exposure_min_time),
+        ("MaxExposureTime", exposure_max_time),
+        ("MinGain", exposure_min_gain),
+        ("MaxGain", exposure_max_gain),
+        ("MinIris", exposure_min_iris),
+        ("MaxIris", exposure_max_iris),
+        ("ExposureTime", exposure_time),
+        ("Gain", exposure_gain),
+        ("Iris", exposure_iris),
+    )
+    if exposure_mode or exposure_priority or any(v is not None for _, v in exposure_values):
         exp_parts: list[str] = []
         if exposure_mode:
             exp_parts.append(f"<tt:Mode>{escape(exposure_mode)}</tt:Mode>")
         if exposure_priority:
             exp_parts.append(f"<tt:Priority>{escape(exposure_priority)}</tt:Priority>")
-        if exposure_min_time is not None:
-            exp_parts.append(f"<tt:MinExposureTime>{exposure_min_time}</tt:MinExposureTime>")
-        if exposure_max_time is not None:
-            exp_parts.append(f"<tt:MaxExposureTime>{exposure_max_time}</tt:MaxExposureTime>")
-        if exposure_min_gain is not None:
-            exp_parts.append(f"<tt:MinGain>{exposure_min_gain}</tt:MinGain>")
-        if exposure_max_gain is not None:
-            exp_parts.append(f"<tt:MaxGain>{exposure_max_gain}</tt:MaxGain>")
-        if exposure_iris is not None:
-            exp_parts.append(f"<tt:Iris>{exposure_iris}</tt:Iris>")
+        exp_parts += [
+            f"<tt:{tag}>{value}</tt:{tag}>" for tag, value in exposure_values if value is not None
+        ]
         fragments.append(f"<tt:Exposure>{''.join(exp_parts)}</tt:Exposure>")
-    if focus_auto_mode:
-        fragments.append(
-            f"<tt:Focus><tt:AutoFocusMode>{escape(focus_auto_mode)}</tt:AutoFocusMode></tt:Focus>"
+    focus_values = (
+        ("DefaultSpeed", focus_default_speed),
+        ("NearLimit", focus_near_limit),
+        ("FarLimit", focus_far_limit),
+    )
+    if focus_auto_mode or any(v is not None for _, v in focus_values):
+        focus_parts = (
+            f"<tt:AutoFocusMode>{escape(focus_auto_mode)}</tt:AutoFocusMode>"
+            if focus_auto_mode
+            else ""
         )
+        focus_parts += "".join(
+            f"<tt:{tag}>{value}</tt:{tag}>" for tag, value in focus_values if value is not None
+        )
+        fragments.append(f"<tt:Focus>{focus_parts}</tt:Focus>")
     if ir_cut_filter:
         fragments.append(f"<tt:IrCutFilter>{escape(ir_cut_filter)}</tt:IrCutFilter>")
     if sharpness is not None:
         fragments.append(f"<tt:Sharpness>{sharpness}</tt:Sharpness>")
-    if wide_dynamic_range_mode or wide_dynamic_range_level is not None:
-        wdr_parts: list[str] = []
-        if wide_dynamic_range_mode:
-            wdr_parts.append(f"<tt:Mode>{escape(wide_dynamic_range_mode)}</tt:Mode>")
-        if wide_dynamic_range_level is not None:
-            wdr_parts.append(f"<tt:Level>{wide_dynamic_range_level}</tt:Level>")
-        fragments.append(f"<tt:WideDynamicRange>{''.join(wdr_parts)}</tt:WideDynamicRange>")
+    fragments.append(
+        _mode_level("WideDynamicRange", wide_dynamic_range_mode, wide_dynamic_range_level)
+    )
     if white_balance_mode or white_balance_cr_gain is not None or white_balance_cb_gain is not None:
         wb_parts: list[str] = []
         if white_balance_mode:
@@ -952,6 +1143,26 @@ def imaging_set_settings(
         if white_balance_cb_gain is not None:
             wb_parts.append(f"<tt:CbGain>{white_balance_cb_gain}</tt:CbGain>")
         fragments.append(f"<tt:WhiteBalance>{''.join(wb_parts)}</tt:WhiteBalance>")
+    fragments.append(
+        _imaging_extension(
+            image_stabilization=_mode_level(
+                "ImageStabilization", image_stabilization_mode, image_stabilization_level
+            ),
+            ir_cut_auto_adjustment=_ir_cut_auto_adjustment(
+                ir_cut_auto_boundary_type, ir_cut_auto_boundary_offset, ir_cut_auto_response_time
+            ),
+            tone_compensation=_mode_level(
+                "ToneCompensation", tone_compensation_mode, tone_compensation_level
+            ),
+            defogging=_mode_level("Defogging", defogging_mode, defogging_level),
+            noise_reduction=(
+                ""
+                if noise_reduction_level is None
+                else f"<tt:NoiseReduction><tt:Level>{noise_reduction_level}</tt:Level>"
+                "</tt:NoiseReduction>"
+            ),
+        )
+    )
 
     body = "".join(fragments)
     return (
@@ -1279,29 +1490,46 @@ def media_set_audio_encoder_configuration(
     use_count: int = 0,
     session_timeout: str = "PT60S",
     force_persistence: bool = True,
+    multicast: Mapping[str, Any] | None = None,
 ) -> str:
     """Build a legacy Media ``SetAudioEncoderConfiguration`` request.
 
     Emits configuration ``token`` with ``encoding``, ``bitrate_kbps`` and ``sample_rate``;
-    ``force_persistence`` maps to the ``ForcePersistence`` flag.
+    ``force_persistence`` maps to the ``ForcePersistence`` flag. Media1 only knows the codec
+    families ``G711``, ``G726`` and ``AAC``, so the RTP names Media2 reports (``PCMU``,
+    ``PCMA``, ``MP4A-LATM``, ``MPEG4-GENERIC``) are translated. ``multicast=None`` writes
+    the unconfigured ``0.0.0.0`` default — pass the current value to keep it.
     """
     return (
         "<trt:SetAudioEncoderConfiguration>"
         f"<trt:Configuration token={quoteattr(token)}>"
         f"<tt:Name>{escape(name)}</tt:Name>"
-        f"<tt:UseCount>{use_count}</tt:UseCount>"
-        f"<tt:Encoding>{escape(encoding)}</tt:Encoding>"
-        f"<tt:Bitrate>{bitrate_kbps}</tt:Bitrate>"
-        f"<tt:SampleRate>{sample_rate}</tt:SampleRate>"
-        "<tt:Multicast>"
-        "<tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>"
-        "<tt:Port>0</tt:Port><tt:TTL>0</tt:TTL><tt:AutoStart>false</tt:AutoStart>"
-        "</tt:Multicast>"
-        f"<tt:SessionTimeout>{session_timeout}</tt:SessionTimeout>"
+        f"<tt:UseCount>{int(use_count)}</tt:UseCount>"
+        f"<tt:Encoding>{escape(_media1_audio_encoding(encoding))}</tt:Encoding>"
+        f"<tt:Bitrate>{int(bitrate_kbps)}</tt:Bitrate>"
+        f"<tt:SampleRate>{int(sample_rate)}</tt:SampleRate>"
+        f"{_multicast_xml(multicast)}"
+        f"<tt:SessionTimeout>{escape(session_timeout or 'PT60S')}</tt:SessionTimeout>"
         "</trt:Configuration>"
-        f"<trt:ForcePersistence>{'true' if force_persistence else 'false'}</trt:ForcePersistence>"
+        f"<trt:ForcePersistence>{_xs_bool(force_persistence)}</trt:ForcePersistence>"
         "</trt:SetAudioEncoderConfiguration>"
     )
+
+
+_MEDIA1_AUDIO_ENCODINGS = {
+    "PCMU": "G711",
+    "PCMA": "G711",
+    "MP4A-LATM": "AAC",
+    "MPEG4-GENERIC": "AAC",
+}
+
+
+def _media1_audio_encoding(encoding: str) -> str:
+    """Translate a Media2 (RTP) audio encoding name to the Media1 ``tt:AudioEncoding``."""
+    upper = encoding.strip().upper()
+    if upper.startswith("G726"):
+        return "G726"
+    return _MEDIA1_AUDIO_ENCODINGS.get(upper, encoding)
 
 
 def media_get_audio_sources() -> str:
@@ -2177,12 +2405,18 @@ def media_set_metadata_configuration(
     use_count: int = 0,
     session_timeout: str = "PT60S",
     force_persistence: bool = True,
+    multicast: Mapping[str, Any] | None = None,
+    events: bool = False,
+    events_topic_filter: str = "",
 ) -> str:
     """Build a ``SetMetadataConfiguration`` request for ``token``.
 
     Toggles the ``analytics`` metadata flag and, when ``ptz_status`` or ``ptz_position``
     is set, a PTZ status/position block; ``force_persistence`` maps to the
-    ``ForcePersistence`` flag.
+    ``ForcePersistence`` flag. ``events`` streams events in the metadata — all of them,
+    or only those matching ``events_topic_filter`` (a ConcreteSet topic expression); a
+    configuration written without it stops carrying events. ``multicast=None`` writes the
+    unconfigured ``0.0.0.0`` default — pass the current value to keep it.
     """
     ptz_block = ""
     if ptz_status or ptz_position:
@@ -2192,18 +2426,27 @@ def media_set_metadata_configuration(
             f"<tt:Position>{'true' if ptz_position else 'false'}</tt:Position>"
             "</tt:PTZStatus>"
         )
+    events_block = ""
+    if events or events_topic_filter:
+        events_block = (
+            "<tt:Events><tt:Filter>"
+            '<wsnt:TopicExpression Dialect="http://www.onvif.org/ver10/tev/'
+            'topicExpression/ConcreteSet">'
+            f"{escape(events_topic_filter)}</wsnt:TopicExpression>"
+            "</tt:Filter></tt:Events>"
+            if events_topic_filter
+            else "<tt:Events/>"
+        )
     return (
         "<trt:SetMetadataConfiguration>"
         f"<trt:Configuration token={quoteattr(token)}>"
         f"<tt:Name>{escape(name)}</tt:Name>"
         f"<tt:UseCount>{int(use_count)}</tt:UseCount>"
         f"{ptz_block}"
+        f"{events_block}"
         f"<tt:Analytics>{'true' if analytics else 'false'}</tt:Analytics>"
-        "<tt:Multicast>"
-        "<tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>"
-        "<tt:Port>0</tt:Port><tt:TTL>0</tt:TTL><tt:AutoStart>false</tt:AutoStart>"
-        "</tt:Multicast>"
-        f"<tt:SessionTimeout>{escape(session_timeout)}</tt:SessionTimeout>"
+        f"{_multicast_xml(multicast)}"
+        f"<tt:SessionTimeout>{escape(session_timeout or 'PT60S')}</tt:SessionTimeout>"
         "</trt:Configuration>"
         f"<trt:ForcePersistence>{'true' if force_persistence else 'false'}</trt:ForcePersistence>"
         "</trt:SetMetadataConfiguration>"

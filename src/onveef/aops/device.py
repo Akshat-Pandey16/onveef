@@ -7,6 +7,7 @@ from typing import Any
 
 from onveef import envelopes, parsers
 from onveef.atransport import AsyncTransport
+from onveef.exceptions import OnvifNotConfiguredError, OnvifValidationError
 
 
 class DeviceOperations(AsyncTransport):
@@ -464,3 +465,35 @@ class DeviceOperations(AsyncTransport):
             body_inner=envelopes.device_start_system_restore(),
         )
         return parsers.parse_upload_target(xml)
+
+    async def change_password(self, *, new_password: str, username: str = "") -> str:
+        """Change an account's password on the device, keeping its user level.
+
+        ``SetUser`` has to restate the user level, so it is read from ``GetUsers`` rather
+        than guessed, and the account is matched case-insensitively (cameras do) and
+        written back under the device's own spelling of its name. ``username`` defaults to
+        the account this client signs in with; changing that one also switches this client
+        to ``new_password``, so it keeps working.
+
+        Returns:
+            The account name as the device spells it.
+
+        Raises:
+            OnvifNotConfiguredError: no ``username`` given and the client has none.
+            OnvifValidationError: the device lists no such account; nothing was changed.
+        """
+        wanted = username or self._credentials.username
+        if not wanted:
+            raise OnvifNotConfiguredError("Pass username=... or give the client credentials.")
+        account = next(
+            (user for user in await self.get_users() if user["username"].lower() == wanted.lower()),
+            None,
+        )
+        if account is None or not account.get("user_level"):
+            raise OnvifValidationError({"username": [f"The device has no account '{wanted}'."]})
+        await self.set_user(
+            username=account["username"], password=new_password, user_level=account["user_level"]
+        )
+        if account["username"].lower() == self._credentials.username.lower():
+            self._use_password(new_password)
+        return str(account["username"])

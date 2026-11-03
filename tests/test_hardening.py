@@ -197,7 +197,14 @@ def test_parse_event_properties_keeps_tns1_prefix() -> None:
     assert out["topics"] == ["tns1:VideoSource/MotionAlarm"]
 
 
-def test_media2_set_video_encoder_uses_attributes() -> None:
+def test_media2_set_video_encoder_follows_the_schema() -> None:
+    """``tt:VideoEncoder2Configuration``: GovLength/Profile are attributes, the rest elements.
+
+    Encoding, Resolution, RateControl (with FrameRateLimit and BitrateLimit as children and
+    ConstantBitRate as its attribute) and Quality are elements, in that order. An earlier
+    version wrote Encoding and the rate limits as attributes, which strict devices reject
+    and lenient ones ignore — the write silently changed nothing.
+    """
     body = envelopes.media2_set_video_encoder_configuration(
         token="VE0",
         name="Main",
@@ -209,15 +216,50 @@ def test_media2_set_video_encoder_uses_attributes() -> None:
         bitrate_kbps=4096,
         gop=30,
         h264_profile="High",
+        constant_bitrate=True,
     )
-    assert 'Encoding="H264"' in body
-    assert 'GovLength="30"' in body
-    assert 'Profile="High"' in body
-    assert 'FrameRateLimit="25"' in body
-    assert 'BitrateLimit="4096"' in body
-    assert "<tt:Encoding>" not in body
-    assert "<tt:GovLength>" not in body
-    assert "<tt:Profile>" not in body
+    assert '<trt2:Configuration token="VE0" GovLength="30" Profile="High">' in body
+    assert "Encoding=" not in body
+    assert "FrameRateLimit=" not in body
+    assert (
+        "<tt:Name>Main</tt:Name><tt:UseCount>0</tt:UseCount><tt:Encoding>H264</tt:Encoding>"
+        "<tt:Resolution><tt:Width>1920</tt:Width><tt:Height>1080</tt:Height></tt:Resolution>"
+        '<tt:RateControl ConstantBitRate="true"><tt:FrameRateLimit>25</tt:FrameRateLimit>'
+        "<tt:BitrateLimit>4096</tt:BitrateLimit></tt:RateControl>"
+        "<tt:Quality>4</tt:Quality>"
+    ) in body
+
+
+def test_media2_set_video_encoder_leaves_the_rate_mode_alone_unless_asked() -> None:
+    """Hardcoding ConstantBitRate="false" turned every CBR stream it touched into VBR."""
+    body = envelopes.media2_set_video_encoder_configuration(
+        token="VE0",
+        name="Main",
+        encoding="H265",
+        width=1920,
+        height=1080,
+        quality=4.0,
+        fps=29.97,
+        bitrate_kbps=4096,
+        gop=None,
+    )
+    assert "ConstantBitRate" not in body
+    assert "<tt:FrameRateLimit>29.97</tt:FrameRateLimit>" in body
+
+
+def test_media2_rate_control_needs_both_limits() -> None:
+    with pytest.raises(ValueError, match="together"):
+        envelopes.media2_set_video_encoder_configuration(
+            token="VE0",
+            name="Main",
+            encoding="H264",
+            width=1,
+            height=1,
+            quality=1.0,
+            fps=25,
+            bitrate_kbps=None,
+            gop=None,
+        )
 
 
 def test_build_envelope_wsa_action_adds_message_id_and_reply_to() -> None:

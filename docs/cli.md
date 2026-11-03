@@ -31,6 +31,7 @@ onveef <command> --help
 onveef discover                                  # sweep every local interface
 onveef discover --address 192.168.1.64           # unicast probe one known device
 onveef discover --interface 10.0.0.2 --probes 5 --ipv6
+onveef locate 192.168.1.64                       # find the ONVIF URL when WS-Discovery is off
 
 onveef info 192.168.1.64 -u admin -p secret      # manufacturer / model / firmware
 onveef services 192.168.1.64 -u admin -p secret  # the discovered XAddr map
@@ -61,11 +62,18 @@ onveef raw 192.168.1.64 --operation GetHostname --body '<tds:GetHostname/>'
 
 ## Capturing fixtures
 
-`dump` records a device's raw responses so they can become regression tests:
+`dump` records a device's responses so they can become regression tests. It sends only read
+requests, captures the per-configuration option sets too, and stops at the first refused
+login so as not to lock the account:
 
 ```bash
 onveef dump 192.168.1.64 -u admin -p secret -d tests/fixtures/mycam
 ```
 
-Redact serials, MACs, hostnames and credentials before committing — see
+Serial numbers, hardware IDs, MAC and IP addresses and name/location scopes are scrubbed
+unless you pass `--no-scrub`; review the rest before committing — see
 [Contributing](contributing.md).
+
+`locate` tries the ports and paths cameras commonly serve ONVIF on (80, 8000, 8080, 8899,
+2020, … × `/onvif/device_service`, `/onvif/Device`, …) with an unauthenticated
+`GetSystemDateAndTime`, for devices that do not answer WS-Discovery.

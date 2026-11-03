@@ -256,3 +256,104 @@ def test_client_factory_maps_flags() -> None:
     assert client._password_text_fallback is False
     assert set(ALL_SERVICES) >= {"device"}
     client.close()
+
+
+_CPPLUS = Path(__file__).parent / "fixtures" / "cpplus"
+
+
+def _recorded_camera(envelope: str) -> tuple[int, str]:
+    """Answer from the CP Plus capture, with an identifying serial and address added."""
+    body = envelope.split("<s:Body>", 1)[1]
+    if "GetDeviceInformation" in body:
+        return 200, (
+            "<GetDeviceInformationResponse><Manufacturer>CPPlus</Manufacturer>"
+            "<Model>CP-UNP</Model><FirmwareVersion>3.2</FirmwareVersion>"
+            "<SerialNumber>4K0123456789</SerialNumber></GetDeviceInformationResponse>"
+        )
+    if "GetNetworkInterfaces" in body:
+        return 200, (
+            "<GetNetworkInterfacesResponse><NetworkInterfaces token='eth0'>"
+            "<Info><HwAddress>a4:14:37:12:34:56</HwAddress></Info><IPv4><Config><Manual>"
+            "<Address>192.168.1.64</Address></Manual></Config></IPv4>"
+            "</NetworkInterfaces></GetNetworkInterfacesResponse>"
+        )
+    name = ("Media2-" if body.startswith("<trt2:") else "") + body[1:].split(">", 1)[0].split(
+        ":", 1
+    )[1].rstrip("/")
+    for token_tag in ("ConfigurationToken>", "VideoSourceToken>"):
+        if token_tag in body:
+            name += "-" + body.split(token_tag, 1)[1].split("<", 1)[0]
+            break
+    path = _CPPLUS / f"{name}.xml"
+    return (200, path.read_text()) if path.exists() else (400, "<Fault/>")
+
+
+def test_dump_scrubs_identity_and_records_per_token_options(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_client(monkeypatch, _recorded_camera)
+    assert cli.main(["dump", "10.0.0.9", "-d", str(tmp_path)]) == 0
+    written = {p.name for p in tmp_path.iterdir()}
+    assert {
+        "GetDeviceInformation.xml",
+        "Media2-GetProfiles.xml",
+        "GetVideoEncoderConfigurationOptions-00001.xml",
+        "Media2-GetVideoEncoderConfigurationOptions-00000.xml",
+        "Media2-GetAudioEncoderConfigurationOptions-00000.xml",
+        "GetVideoSourceConfigurationOptions-00000.xml",
+        "GetOptions-00000.xml",
+        "camera.json",
+    } <= written
+    info = (tmp_path / "GetDeviceInformation.xml").read_text()
+    assert "4K0123456789" not in info and "REDACTED" in info
+    network = (tmp_path / "GetNetworkInterfaces.xml").read_text()
+    assert "a4:14:37" not in network and "192.168.1.64" not in network
+    assert "<Address>192.0.2." in network
+    manifest = json.loads((tmp_path / "camera.json").read_text())
+    assert (manifest["manufacturer"], manifest["model"], manifest["scrubbed"]) == (
+        "CPPlus",
+        "CP-UNP",
+        True,
+    )
+    assert "Redacted" in capsys.readouterr().err
+
+
+def test_dump_can_keep_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _patch_client(monkeypatch, _recorded_camera)
+    assert cli.main(["dump", "10.0.0.9", "-d", str(tmp_path), "--no-scrub"]) == 0
+    assert "4K0123456789" in (tmp_path / "GetDeviceInformation.xml").read_text()
+
+
+def test_dump_stops_at_a_refused_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Cameras lock accounts after a few failed logins: one refusal ends the capture."""
+    captured = _patch_client(monkeypatch, lambda _e: (401, ""))
+    assert cli.main(["dump", "10.0.0.9", "-d", str(tmp_path)]) == 1
+    assert len([e for e in captured if "GetDeviceInformation" in e]) == 1
+    assert "refused the login" in capsys.readouterr().err
+
+
+def test_scrub_keeps_multicast_and_settings() -> None:
+    xml = (
+        "<tt:IPv4Address>224.1.0.0</tt:IPv4Address><tt:Address>0.0.0.0</tt:Address>"
+        "<tt:Uri>rtsp://10.1.2.3:554/x</tt:Uri><tt:Name>Main</tt:Name>"
+    )
+    scrubbed = cli.scrub(xml)
+    assert "224.1.0.0" in scrubbed and "0.0.0.0" in scrubbed and "<tt:Name>Main" in scrubbed
+    assert "10.1.2.3" not in scrubbed
+    assert (
+        cli.scrub("<Address>10.1.2.3</Address><Uri>http://10.1.2.3/</Uri>").count("192.0.2.") == 2
+    )
+
+
+def test_locate_prints_the_device_service(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    found = "http://10.0.0.9:8000/onvif/device_service"
+    monkeypatch.setattr(wsdiscovery, "find_device_service", lambda *_a, **_k: found)
+    assert cli.main(["locate", "10.0.0.9"]) == 0
+    assert capsys.readouterr().out.strip() == found
+    monkeypatch.setattr(wsdiscovery, "find_device_service", lambda *_a, **_k: None)
+    assert cli.main(["locate", "10.0.0.9"]) == 1
+    assert "No ONVIF device service" in capsys.readouterr().err

@@ -56,24 +56,27 @@ tail of firmware. To capture a set:
 uv run onveef dump 192.168.1.64 -u admin -p secret -d tests/fixtures/<vendor>
 ```
 
+`dump` only sends read (`Get*`) requests, and stops at the first refused login rather than
+risk locking the account. Besides the device-wide replies it records, per configuration and
+per video source, the option sets the settings helpers validate against —
+`GetVideoEncoderConfigurationOptions-<token>.xml`, `GetOptions-<source>.xml` and so on, with
+Media2 replies prefixed `Media2-` — plus a `camera.json` naming the model and firmware.
 Then add a test in `tests/test_fixtures.py` asserting the parsers extract sane values.
 
-**Redact before committing.** Raw ONVIF responses routinely contain data you do not want in
-a public repository:
+**Review before committing.** Raw ONVIF responses routinely contain data you do not want in
+a public repository. `dump` scrubs the common cases itself (pass `--no-scrub` to keep them):
 
-| Redact | Where it appears |
+| Scrubbed automatically | Becomes |
 |---|---|
-| Serial numbers, hardware IDs | `GetDeviceInformation` |
-| MAC addresses | `GetNetworkInterfaces` |
-| Public/private IPs, hostnames | `GetNetworkInterfaces`, `GetServices`, `GetStreamUri` |
-| Site or location names | `GetScopes`, recording configurations |
-| Usernames | `GetUsers`, storage configurations |
-| Passwords, credential tokens | storage configurations, `GetDot1XConfigurations` |
+| Serial numbers, hardware IDs | `REDACTED` |
+| MAC addresses | `00:00:5E:00:53:01` |
+| Unicast IPs in URLs and `*Address` elements | `192.0.2.x` / `2001:db8::1` (documentation ranges) |
+| `name` and `location` scopes | `REDACTED` |
 
-Replace them with obvious placeholders (`SN-REDACTED`, `00:11:22:33:44:55`, `192.168.1.64`)
-rather than deleting the elements — the *shape* of the response is the thing being tested.
-Keep the vendor's element ordering, namespace prefixes and quirks exactly as sent; those
-quirks are the reason the fixture is worth having.
+Still check by hand for site names in recording or OSD text, usernames in storage
+configurations, and anything vendor-specific. Replace rather than delete — the *shape* of
+the response is the thing being tested. Keep the vendor's element ordering, namespace
+prefixes and quirks exactly as sent; those quirks are the reason the fixture is worth having.
 
 ## Commits and releases
 
